@@ -6,21 +6,53 @@ import argparse
 import subprocess
 import urllib.request
 from pathlib import Path
+# CORRIGIDO: `Optional` era usado na linha 65 (ThinkingStreamer.resume) sem ter
+# sido importado. Como e uma anotacao avaliada no momento da definicao da classe,
+# levantava NameError ao importar o modulo -- o harness de terminal NEM ARRANCAVA
+# (nao era so o --help: nenhum comando funcionava).
+from typing import Optional, List, Dict, Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from rich.live import Live
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.styles import Style
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.styles import Style
+except ModuleNotFoundError:  # pragma: no cover - optional CLI-only dependency
+    PromptSession = None
+    InMemoryHistory = None
+    Style = None
 
 from apex_harness.core import ApexAgent
 from apex_harness.tools import TOOLS_DEFINITION
 from apex_harness.mcp_client import get_mcp_manager
+from apex_harness.session_memory import get_session_memory
 
 console = Console()
+
+_LIVE_METRIC_STATE: Dict[str, float] = {}
+
+
+def smooth_live_metric(metric_name: str, value: float, alpha: float = 0.35) -> float:
+    """Smooth streamed metrics so the terminal display feels stable and readable.
+
+    The underlying inference backend can fluctuate from one chunk to the next,
+    especially when timing data is sparse or computed on the fly. A small EMA
+    prevents the display from jittering while still reflecting the real trend.
+    """
+    clean_value = float(value or 0.0)
+    previous = _LIVE_METRIC_STATE.get(metric_name)
+    if previous is None:
+        _LIVE_METRIC_STATE[metric_name] = clean_value
+        return clean_value
+
+    smoothed = previous + alpha * (clean_value - previous)
+    _LIVE_METRIC_STATE[metric_name] = smoothed
+    return smoothed
 
 
 class ThinkingStreamer:
@@ -28,6 +60,16 @@ class ThinkingStreamer:
     Controla a animação em tempo real de pensamento (<think>...</think>) e
     a transição fluida para a resposta do assistente.
     """
+    CLAUDE_PHRASES = [
+        "Pensando...",
+        "Refletindo sobre a resposta...",
+        "Examinando arquivos e contexto...",
+        "Analisando restrições e código...",
+        "Sintetizando solução...",
+        "Consultando ferramentas...",
+        "Elaborando raciocínio..."
+    ]
+
     def __init__(self, console: Console, show_thinking: bool = False):
         self.console = console
         self.show_thinking = show_thinking
@@ -38,8 +80,12 @@ class ThinkingStreamer:
         self.first_content_token = True
         self.buf = ""
         self.thought_chars = 0
-        self.status = console.status("[bold cyan]Pensando...[/bold cyan]", spinner="dots")
+        self.status = console.status(f"[bold cyan]{self.CLAUDE_PHRASES[0]}[/bold cyan]", spinner="dots")
         self.status.start()
+
+    def _get_phrase(self, elapsed: float) -> str:
+        idx = int(elapsed // 1.8) % len(self.CLAUDE_PHRASES)
+        return self.CLAUDE_PHRASES[idx]
 
     def pause(self):
         if self.status:
@@ -48,10 +94,12 @@ class ThinkingStreamer:
             except Exception:
                 pass
 
-    def resume(self, msg: str = "[bold cyan]Pensando...[/bold cyan]"):
+    def resume(self, msg: Optional[str] = None):
         if self.status and (self.in_think or self.first_content_token):
             try:
-                self.status.update(msg)
+                elapsed = time.time() - self.start_time
+                phrase = msg or f"[bold cyan]{self._get_phrase(elapsed)}[/bold cyan]"
+                self.status.update(phrase)
                 self.status.start()
             except Exception:
                 pass
@@ -68,7 +116,8 @@ class ThinkingStreamer:
             _, after = self.buf.split("<think>", 1)
             self.buf = after
             if self.status:
-                self.status.update(f"[bold cyan]Pensando...[/bold cyan] [dim]({elapsed:.1f}s)[/dim]")
+                phrase = self._get_phrase(elapsed)
+                self.status.update(f"[bold cyan]{phrase}[/bold cyan] [dim]({elapsed:.1f}s)[/dim]")
             if self.show_thinking:
                 self.pause()
                 self.console.print("\n[dim italic]🧠 Raciocínio:[/dim italic]")
@@ -102,7 +151,8 @@ class ThinkingStreamer:
                 else:
                     self.thought_chars += len(chunk)
                     if self.thought_chars % 25 == 0 and self.status:
-                        self.status.update(f"[bold cyan]Pensando...[/bold cyan] [dim]({elapsed:.1f}s)[/dim]")
+                        phrase = self._get_phrase(elapsed)
+                        self.status.update(f"[bold cyan]{phrase}[/bold cyan] [dim]({elapsed:.1f}s)[/dim]")
                 return
 
         # 3. Resposta regular
@@ -139,11 +189,16 @@ def print_help():
     table.add_column("Command", style="bold green", width=22)
     table.add_column("Description", style="white")
     table.add_row("/help", "Exibe esta tela com todos os comandos disponíveis")
+    table.add_row("/btw <mensagem>", "Injeta uma nota lateral / interrupção de raciocínio no contexto")
+    table.add_row("/model [nome]", "Troca o modelo LLM ativo no meio da tarefa (hot-swap)")
+    table.add_row("/web [porta]", "Abre a Web UI estilo DeepSeek Harness no navegador")
     table.add_row("/effort [low|med|high|off]", "Ajusta o nível de raciocínio (effort) do modelo")
     table.add_row("/think [on|off]", "Alterna exibição detalhada do raciocínio (<think>)")
     table.add_row("/clear, /new", "Limpa o histórico da sessão e inicia um novo tópico")
     table.add_row("/compact", "Compacta o contexto anterior para economizar tokens de memória")
     table.add_row("/doctor", "Verifica a saúde do sistema (Servidor, GPU, RAM, MCP, Ferramentas)")
+    table.add_row("/npu", "Exibe diagnóstico do NPU AMD XDNA2 (driver, firmware, Lemonade runtime)")
+    table.add_row("/subagents", "Lista os subagentes especializados e alocação de hardware (NPU vs GPU)")
     table.add_row("/tdp <task>", "Pipeline Context! (TDP): Researcher + Planner (PTCF) + Executor/Healer")
     table.add_row("/rag [ingest|search|ask] <args>", "Hybrid RAG + Rerank local sobre documentos e código")
     table.add_row("/bench [model]", "Mede TTFT, PP t/s e TG t/s com isolamento de warm-up")
@@ -152,6 +207,9 @@ def print_help():
     table.add_row("/review", "Analisa e revisa alterações não commitadas (git diff) no projeto")
     table.add_row("/commit", "Gera uma mensagem de commit inteligente e commita via Git")
     table.add_row("/cost", "Exibe estimativas de tokens consumidos e tamanho de contexto")
+    table.add_row("/sessions", "Lista sessões anteriores com timestamp, decisões e tarefas")
+    table.add_row("/resume <id>", "Injeta o contexto/decisões de uma sessão anterior no histórico")
+    table.add_row("/trace [export]", "Gera e exporta dashboard HTML de observabilidade e telemetria")
     table.add_row("/tools", "Lista todas as ferramentas disponíveis (Built-in + MCP)")
     table.add_row("/status", "Exibe endpoint ativo, modelo carregado e pasta atual")
     table.add_row("/exit, /quit", "Encerra a sessão do Apex Harness")
@@ -238,6 +296,25 @@ def run_doctor(agent: ApexAgent):
     except Exception:
         table.add_row("Memória RAM", "[green]OK[/green]", "96GB RAM Unificada")
 
+    # 4. NPU AMD XDNA2
+    try:
+        from apex_harness.npu_detect import npu_available
+        npu_st = npu_available()
+        if npu_st.usable:
+            npu_badge = "[green]ATIVO[/green]"
+        elif npu_st.driver_loaded:
+            npu_badge = "[yellow]DRIVER OK[/yellow]"
+        else:
+            npu_badge = "[dim]NÃO DETECTADO[/dim]"
+        lemonade_status = "Instalado" if npu_st.lemonade_available else "Não instalado"
+        table.add_row(
+            "NPU AMD XDNA2",
+            npu_badge,
+            f"Driver: {npu_st.driver_version or 'amdxdna'} | Lemonade: {lemonade_status} | {npu_st.notes}"
+        )
+    except Exception as e:
+        table.add_row("NPU AMD XDNA2", "[dim]IGNORADO[/dim]", str(e)[:50])
+
     # 4. MCP Servers
     try:
         mgr = get_mcp_manager()
@@ -254,6 +331,36 @@ def run_doctor(agent: ApexAgent):
     table.add_row("Total de Ferramentas", f"[green]{len(agent.tools)} CARREGADAS[/green]", "Built-in (web, bash, os) + MCP")
 
     console.print(table)
+
+def format_live_usage(info: Dict[str, Any]) -> str:
+    if not info:
+        return ""
+
+    prompt = int(info.get("prompt_tokens") or 0)
+    completion = int(info.get("completion_tokens") or 0)
+    prefill = float(info.get("prefill_tps") or 0.0)
+    decode = float(info.get("decode_tps") or 0.0)
+
+    parts = [
+        f"Prompt {prompt}",
+        f"Completion {completion}",
+        f"Prefill {prefill:.1f} t/s",
+        f"Decode {decode:.1f} t/s",
+    ]
+    return " | ".join(parts)
+
+
+def print_live_usage(info: Dict[str, Any]):
+    if not info:
+        return
+
+    smoothed = {
+        **info,
+        "prefill_tps": smooth_live_metric("prefill_tps", float(info.get("prefill_tps") or 0.0)),
+        "decode_tps": smooth_live_metric("decode_tps", float(info.get("decode_tps") or 0.0)),
+    }
+    console.print(f"[dim]{format_live_usage(smoothed)}[/dim]")
+
 
 def run_init():
     target = Path.cwd() / "APEX.md"
@@ -314,16 +421,25 @@ def run_commit(agent: ApexAgent):
             return
 
         diff_summary = subprocess.check_output(["git", "diff", "--stat"], text=True).strip()
+        diff_sample = subprocess.check_output(["git", "diff"], text=True).strip()
         console.print(f"[dim]{stat}[/dim]\n")
-        
-        prompt = f"Gere uma mensagem de commit no formato convencional (ex: feat: ..., fix: ..., refactor: ...) concisa em 1 linha baseada nestas alterações:\n{stat}\n{diff_summary}"
-        
-        with console.status("Gerando mensagem de commit...", spinner="dots"):
-            commit_msg = agent.step(prompt).strip().replace('"', '').replace("`", "")
-            if "\n" in commit_msg:
-                commit_msg = commit_msg.splitlines()[0]
 
-        console.print(f"[bold cyan]Mensagem sugerida:[/bold cyan] [bold white]{commit_msg}[/bold white]")
+        with console.status("Subagente gerando mensagem de commit...", spinner="dots"):
+            from apex_harness.subagents import CommitSubagent
+            commit_sub = CommitSubagent()
+            res = commit_sub.generate_commit_message(stat, diff_summary, diff_sample)
+            if res.success and res.content:
+                commit_msg = res.content
+                hw_info = f"[dim cyan]({res.hardware} • {res.latency_ms:.0f}ms)[/dim cyan]"
+            else:
+                commit_msg = f"refactor: update code changes\n\n{stat}"
+                hw_info = "[dim yellow](Fallback básico)[/dim yellow]"
+
+        console.print(Panel(
+            f"{commit_msg}\n\n{hw_info}",
+            title="📝 Mensagem de Commit Sugerida",
+            border_style="green"
+        ))
         confirm = console.input("[yellow]Deseja commitar todas as alterações com esta mensagem? (s/N): [/yellow]").strip().lower()
         if confirm in ["s", "sim", "y", "yes"]:
             subprocess.run(["git", "add", "-A"])
@@ -348,8 +464,21 @@ def main():
     args = parser.parse_args()
 
     console.print(BANNER)
-    console.print(f"[dim]Endpoint: [bold green]{args.url}[/bold green] | Modelo: [bold yellow]{args.model}[/bold yellow] | Projeto: [bold cyan]{Path.cwd()}[/bold cyan][/dim]")
+    session_mem = get_session_memory()
+    active_session_id = session_mem.ensure_session_id()
+    console.print(f"[dim]Sessão persistente: [bold green]{active_session_id}[/bold green] | Endpoint: [bold green]{args.url}[/bold green] | Modelo: [bold yellow]{args.model}[/bold yellow] | Projeto: [bold cyan]{Path.cwd()}[/bold cyan][/dim]")
     console.print("[dim]Digite sua mensagem ou use [bold]/help[/bold] para comandos. Ctrl+C cancela, Ctrl+D sai.\n[/dim]")
+
+    # Warm start NPU manager in background if NPU is usable (parallel warm-up)
+    try:
+        from apex_harness.npu_detect import npu_available
+        from apex_harness.npu_backend import get_npu_manager
+        if npu_available().usable:
+            mgr = get_npu_manager()
+            if not mgr.is_running():
+                mgr.start(wait_ready=False)
+    except Exception:
+        pass
 
     show_thinking = args.show_thinking
     agent = ApexAgent(
@@ -384,6 +513,55 @@ def main():
                     sys.exit(0)
                 elif cmd in ["/help", "/h"]:
                     print_help()
+                    continue
+                elif cmd == "/btw":
+                    parts = user_input.strip().split(maxsplit=1)
+                    if len(parts) > 1 and parts[1].strip():
+                        res = agent.inject_btw(parts[1].strip())
+                        console.print(f"[green]✓ {res}[/green]")
+                    else:
+                        console.print("[yellow]Uso: /btw <mensagem ou orientação de raciocínio>[/yellow]")
+                    continue
+                elif cmd in ["/model", "/switch"]:
+                    parts = user_input.strip().split(maxsplit=1)
+                    if len(parts) > 1 and parts[1].strip():
+                        res = agent.set_model(parts[1].strip())
+                        console.print(f"[green]✓ {res}[/green]")
+                    else:
+                        avail_models = []
+                        try:
+                            import json as _json
+                            import urllib.request as _req
+                            raw = _req.urlopen(f"{agent.base_url}/models", timeout=3).read()
+                            models_data = _json.loads(raw)
+                            avail_models = [m.get("id", "") for m in models_data.get("data", []) if m.get("id")]
+                        except Exception:
+                            pass
+                        models_str = ", ".join(f"[bold green]{m}[/bold green]" for m in avail_models) if avail_models else "[dim]Não foi possível listar via API[/dim]"
+                        console.print(Panel(
+                            f"Modelo atualmente ativo: [bold yellow]{agent.model_name}[/bold yellow]\n\n"
+                            f"Modelos disponíveis na API ({agent.base_url}):\n  {models_str}\n\n"
+                            "Uso para alterar modelo no meio da tarefa:\n"
+                            "  • [bold cyan]/model <nome_do_modelo>[/bold cyan]\n"
+                            "  • Exemplo: [italic]/model qwen2.5-coder-7b-instruct[/italic]",
+                            title="🔄 Troca Dinâmica de Modelo (Hot-Swap)",
+                            border_style="cyan"
+                        ))
+                    continue
+                elif cmd in ["/web", "/browser"]:
+                    parts = user_input.strip().split()
+                    port = 7860
+                    if len(parts) > 1 and parts[1].isdigit():
+                        port = int(parts[1])
+                    console.print(f"[bold cyan]🌐 Iniciando DeepSeek Harness Web UI na porta {port}...[/bold cyan]")
+                    try:
+                        from apex_harness.server import start_server_in_thread
+                        url = start_server_in_thread(agent=agent, port=port)
+                        console.print(f"[bold green]✓ Web UI ativa em: [underline]{url}[/underline][/bold green]")
+                        import webbrowser
+                        webbrowser.open(url)
+                    except Exception as web_err:
+                        console.print(f"[red]Erro ao iniciar Web UI: {web_err}[/red]")
                     continue
                 elif cmd in ["/effort", "/reasoning"]:
                     parts = user_input.strip().split()
@@ -424,15 +602,36 @@ def main():
                     elif len(parts) > 1 and parts[1].lower() in ["unload", "off", "disable", "descarregar", "remover"]:
                         agent.tools = [t for t in agent.tools if not t["function"]["name"].startswith("mcp_")]
                         console.print(f"[yellow]✓ Ferramentas MCP descarregadas (Modo Turbo: ~4.2 t/s). Total de ferramentas: {len(agent.tools)}[/yellow]")
+                    elif len(parts) > 1 and parts[1].lower() in ["select", "set", "choose", "escolher"]:
+                        selected = parts[2:]
+                        if not selected:
+                            console.print("[yellow]Uso: /mcp select <nome1> <nome2> ...[/yellow]")
+                            mgr = get_mcp_manager()
+                            if mgr.servers:
+                                console.print(f"[dim]Disponíveis: {', '.join(mgr.servers.keys())}[/dim]")
+                            continue
+                        mgr = get_mcp_manager()
+                        available = list(mgr.servers.keys())
+                        invalid = [name for name in selected if name not in available]
+                        if invalid:
+                            console.print(f"[red]Servidores MCP inválidos: {', '.join(invalid)}[/red]")
+                            console.print(f"[dim]Disponíveis: {', '.join(available) if available else 'nenhum'}[/dim]")
+                            continue
+                        os.environ["APEX_MCP_SERVERS"] = ",".join(selected)
+                        mgr.set_enabled_servers(selected)
+                        agent.tools = [t for t in agent.tools if not t["function"]["name"].startswith("mcp_")]
+                        agent._init_mcp()
+                        console.print(f"[green]✓ MCPs ativos definidos: {', '.join(selected)}[/green]")
                     else:
                         print_mcp_servers(agent)
-                        console.print("[dim]Dica: use [bold]/mcp load[/bold] para ativar ou [bold]/mcp unload[/bold] para acelerar.[/dim]")
+                        console.print("[dim]Dica: use [bold]/mcp load[/bold] para ativar, [bold]/mcp unload[/bold] para acelerar, ou [bold]/mcp select alpha beta[/bold] para escolher só alguns.[/dim]")
                     continue
                 elif cmd in ["/tools", "/t"]:
                     print_tools(agent)
                     continue
                 elif cmd in ["/clear", "/new", "/reset"]:
                     agent.reset()
+                    get_session_memory().ensure_session_id()
                     console.print("[green]✓ Contexto limpo. Nova conversa iniciada.[/green]")
                     continue
                 elif cmd in ["/compact", "/c"]:
@@ -442,10 +641,57 @@ def main():
                 elif cmd in ["/doctor", "/diag"]:
                     run_doctor(agent)
                     continue
+                elif cmd in ["/npu", "/xdna"]:
+                    from apex_harness.npu_detect import npu_available
+                    st = npu_available()
+                    console.print(Panel(st.report, title="[bold cyan]AMD XDNA2 NPU Status[/bold cyan]", border_style="cyan"))
+                    continue
+                elif cmd in ["/subagents", "/subagent"]:
+                    from apex_harness.subagents import get_subagent_registry
+                    reg = get_subagent_registry()
+                    t = Table(title="🤖 Apex Subagentes Especialistas (NPU / GPU Offload)", show_header=True, header_style="bold cyan")
+                    t.add_column("Subagente", style="bold green", width=18)
+                    t.add_column("Função", style="white", width=30)
+                    t.add_column("Modelo (NPU / Default)", style="yellow", width=26)
+                    t.add_column("Hardware Alvo", style="cyan", width=22)
+                    t.add_column("Status", style="bold", width=18)
+                    for s in reg:
+                        status_style = "green" if "Ativa" in s["status"] else "yellow"
+                        t.add_row(
+                            s["name"],
+                            s["role"],
+                            f"{s['model_npu']} / {s['model_default']}",
+                            s["target_hw"],
+                            f"[{status_style}]{s['status']}[/{status_style}]"
+                        )
+                    console.print(t)
+                    console.print("[dim]Subagentes executam em contextos efêmeros isolados sem poluir o histórico principal.[/dim]\n")
+                    continue
+                elif cmd == "/triage":
+                    raw_task = user_input.strip()[len("/triage"):].strip()
+                    if not raw_task:
+                        console.print("[yellow]Uso: /triage <descrição do problema ou requisitos>[/yellow]")
+                        continue
+                    from apex_harness.subagents import TriageSubagent
+                    triage_sub = TriageSubagent()
+                    with console.status("Subagente destilando requisitos na NPU...", spinner="dots"):
+                        resp = triage_sub.triage_task(raw_task)
+                    if resp.success:
+                        badge = f"[bold green]⚡ {resp.hardware} ({resp.latency_ms:.0f}ms)[/bold green]"
+                        console.print(Panel(resp.content, title=f"📋 Especificação Destilada — {badge}", border_style="green"))
+                    else:
+                        console.print(f"[red]Erro no subagente de triagem: {resp.error}[/red]")
+                    continue
                 elif cmd in ["/bench", "/benchmark"]:
-                    # Auto-detect model path from the running server if not provided.
                     parts = user_input.strip().split(maxsplit=1)
                     model_arg = parts[1].strip() if len(parts) > 1 else None
+                    if model_arg in ["critic", "--critic"]:
+                        bench_cmd = [sys.executable, "-m", "apex_harness.bench", "--critic"]
+                        try:
+                            subprocess.run(bench_cmd, check=False)
+                        except Exception as bench_err:
+                            console.print(f"[red]Erro no bench: {bench_err}[/red]")
+                        continue
                     if model_arg is None:
                         try:
                             import json as _json
@@ -654,7 +900,70 @@ def main():
                         title="Status do Apex",
                         border_style="cyan"
                     ))
+                elif cmd in ["/sessions", "/session"]:
+                    from apex_harness.session_memory import get_session_memory
+                    mem = get_session_memory()
+                    sessions = mem.list_sessions(limit=10)
+                    if not sessions:
+                        console.print("[yellow]Nenhuma sessão registrada anteriormente.[/yellow]")
+                    else:
+                        table = Table(title="🗄️ Sessões Anteriores do Apex", show_header=True, header_style="bold cyan")
+                        table.add_column("Session ID", style="bold green", width=20)
+                        table.add_column("Início", style="dim", width=18)
+                        table.add_column("Última Atividade", style="white", width=18)
+                        table.add_column("Eventos", style="yellow", width=8)
+                        table.add_column("Resumo", style="white")
+                        for s in sessions:
+                            s_start = s["started_at"][:19].replace("T", " ")
+                            s_act = s["last_active"][:19].replace("T", " ")
+                            table.add_row(s["id"], s_start, s_act, str(s["event_count"]), s["summary"] or "—")
+                        console.print(table)
+                        console.print("[dim]Use [bold]/resume <session_id>[/bold] para carregar o histórico de uma sessão.[/dim]")
                     continue
+
+                elif cmd in ["/resume"]:
+                    parts = user_input.strip().split(maxsplit=1)
+                    if len(parts) < 2:
+                        console.print("[yellow]Uso: /resume <session_id>[/yellow]")
+                        continue
+                    sess_id = parts[1].strip()
+                    from apex_harness.session_memory import get_session_memory
+                    mem = get_session_memory()
+                    resumed_text = mem.resume_session(sess_id)
+                    if "not found" in resumed_text.lower():
+                        console.print(f"[red]{resumed_text}[/red]")
+                        continue
+
+                    agent.history.append({
+                        "role": "user",
+                        "content": f"[Contexto de Sessão Anterior Injetado]\n{resumed_text}"
+                    })
+                    agent.history.append({
+                        "role": "assistant",
+                        "content": f"Contexto da sessão '{sess_id}' retomado com sucesso. Estou ciente das decisões tomadas e tarefas pendentes."
+                    })
+                    console.print(Panel(
+                        resumed_text,
+                        title=f"🔄 Sessão {sess_id} Retomada",
+                        border_style="green"
+                    ))
+                    continue
+
+                elif cmd in ["/trace", "/telemetry"]:
+                    parts = user_input.strip().split(maxsplit=2)
+                    from apex_harness.trace import get_trace_logger
+                    logger = get_trace_logger()
+
+                    target_file = parts[2].strip() if len(parts) > 2 else str(logger.log_dir / "dashboard.html")
+                    out = logger.export_html(output_path=target_file)
+                    console.print(Panel(
+                        f"Dashboard HTML exportado com sucesso em:\n[bold cyan]{out}[/bold cyan]\n\n"
+                        f"Abra no navegador para visualizar a telemetria completa de execuções.",
+                        title="📊 Telemetria & Tracing",
+                        border_style="cyan"
+                    ))
+                    continue
+
                 else:
                     console.print(f"[red]Comando desconhecido: {user_input}. Digite /help para ver os comandos.[/red]")
                     continue
@@ -681,7 +990,8 @@ def main():
                     user_input=user_input,
                     on_tool_start=on_tool_start,
                     on_tool_finish=on_tool_finish,
-                    on_chunk=streamer.on_chunk
+                    on_chunk=streamer.on_chunk,
+                    on_usage=lambda info: print_live_usage(info)
                 )
             finally:
                 streamer.finish()

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apex Harness — Web UI & Model Switcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar: Sessions & Tools -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">⚡</span>
+          <span class="logo-text">Apex Harness</span>
+        </div>
+        <button id="btn-new-chat" class="btn-icon" title="Nova Conversa (/clear)">
+          <span>+</span>
+        </button>
+      </div>
+
+      <!-- ── Monitor Ao Vivo ─────────────────────────────────────────── -->
+      <div class="sidebar-section monitor-section">
+        <div class="monitor-header" id="monitor-toggle" title="Clique para expandir/recolher">
+          <span class="monitor-pulse" id="monitor-pulse"></span>
+          <h3 style="margin:0; flex:1">Monitor</h3>
+          <span class="monitor-chevron" id="monitor-chevron">▲</span>
+        </div>
+
+        <div class="monitor-body" id="monitor-body">
+          <!-- Estado -->
+          <div class="mon-row mon-state-row">
+            <span class="mon-dot-state" id="mon-dot"></span>
+            <span class="mon-state-label" id="mon-state">—</span>
+            <span class="mon-elapsed" id="mon-elapsed"></span>
+          </div>
+
+          <!-- Contexto -->
+          <div class="mon-metric-label">Contexto</div>
+          <div class="mon-bar-wrap">
+            <div class="mon-bar-track">
+              <div class="mon-bar-fill ctx-fill" id="mon-ctx-bar" style="width:0%"></div>
+            </div>
+            <span class="mon-bar-pct" id="mon-ctx-pct">0%</span>
+          </div>
+          <div class="mon-sub" id="mon-ctx-tokens">— / — tok</div>
+
+          <!-- Velocidade -->
+          <div class="mon-grid-2">
+            <div class="mon-metric">
+              <div class="mon-metric-label">Decode</div>
+              <div class="mon-metric-val" id="mon-decode">— t/s</div>
+            </div>
+            <div class="mon-metric">
+              <div class="mon-metric-label">Cache KV</div>
+              <div class="mon-metric-val" id="mon-cache">—</div>
+            </div>
+          </div>
+
+          <!-- RAM -->
+          <div class="mon-metric-label">RAM Sistema</div>
+          <div class="mon-bar-wrap">
+            <div class="mon-bar-track">
+              <div class="mon-bar-fill ram-fill" id="mon-ram-bar" style="width:0%"></div>
+            </div>
+            <span class="mon-bar-pct" id="mon-ram-pct">0%</span>
+          </div>
+
+          <!-- Sessão -->
+          <div class="mon-session-grid">
+            <div class="mon-sess-item">
+              <span class="mon-sess-label">📖 Lido</span>
+              <span class="mon-sess-val" id="mon-sess-read">0</span>
+            </div>
+            <div class="mon-sess-item">
+              <span class="mon-sess-label">✍ Escrito</span>
+              <span class="mon-sess-val" id="mon-sess-written">0</span>
+            </div>
+            <div class="mon-sess-item mon-sess-total">
+              <span class="mon-sess-label">∑ Total</span>
+              <span class="mon-sess-val" id="mon-sess-total">0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- ── fim Monitor ─────────────────────────────────────────────── -->
+
+      <div class="sidebar-section">
+        <h3>Histórico de Sessões</h3>
+        <div id="sessions-list" class="sessions-list">
+          <div class="empty-sessions">Buscando sessões...</div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="hw-badge">
+          <span class="dot green"></span> AMD Ryzen AI 9 / 96GB RAM
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Header Controls -->
+      <header class="header">
+        <div class="header-left">
+          <div class="project-selector-wrapper">
+            <span class="project-icon">📁</span>
+            <span id="project-path" class="project-path" title="Clique para alterar a pasta de trabalho">Carregando pasta...</span>
+            <button id="btn-change-folder" class="btn-sm" title="Alterar pasta de trabalho">Alterar</button>
+          </div>
+          <div class="model-selector-wrapper">
+            <label for="model-select">🤖 Modelo:</label>
+            <select id="model-select" class="select-dropdown">
+              <option value="">Carregando modelos...</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="header-right">
+          <div class="status-badge" id="model-status-badge" title="Status do Modelo">
+            <span class="dot" id="model-status-dot"></span>
+            <span id="model-load-text">Modelo: Verificando...</span>
+          </div>
+          <div class="status-badge" id="context-status-badge" title="Uso do Context Window">
+            <span>📊 Contexto:</span>
+            <span id="context-load-text" class="text-accent">0%</span>
+          </div>
+          <div class="effort-selector-wrapper">
+            <label for="effort-select">🧠 Raciocínio:</label>
+            <select id="effort-select" class="select-dropdown">
+              <option value="medium">Médio ⚖️</option>
+              <option value="low">Baixo ⚡</option>
+              <option value="high">Alto 🧠</option>
+              <option value="off">Desligado 🚀</option>
+            </select>
+          </div>
+          <button id="btn-clear" class="btn btn-secondary">Limpar Contexto</button>
+        </div>
+      </header>
+
+      <!-- Chat History Stream -->
+      <div id="chat-stream" class="chat-stream">
+        <div class="welcome-card">
+          <h2>⚡ Apex Harness Web Interface</h2>
+          <p>Harness local autônomo conectado ao servidor de inferência. Suporta <strong>/btw</strong> para interrupção de raciocínio e <strong>troca dinamica de modelo mid-task</strong>.</p>
+          <div class="feature-tags">
+            <span class="tag">💡 Interrupção /btw</span>
+            <span class="tag">🔄 Model Hot-Swap</span>
+            <span class="tag">🧠 Reasoning Traces</span>
+            <span class="tag">💾 Session Memory</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Input Area -->
+      <footer class="input-footer">
+        <div class="input-box-wrapper">
+          <!-- Anexar imagem (requer modelo VL com mmproj) -->
+          <button id="btn-attach" class="btn-attach" type="button"
+                  title="Anexar imagem (requer modelo com visão)">
+            <span>🖼️</span>
+          </button>
+          <input type="file" id="file-input" accept="image/*" multiple hidden>
+
+          <!-- Anexar ficheiro de texto: funciona com QUALQUER modelo -->
+          <button id="btn-attach-file" class="btn-attach" type="button"
+                  title="Anexar ficheiro (código, PDF, CSV, JSON, TXT…) — o conteúdo é injetado no prompt">
+            <span>📎</span>
+          </button>
+          <input type="file" id="file-text-input"
+                 accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.html,.css,.json,.jsonl,.yaml,.yml,.toml,.csv,.tsv,.sql,.sh,.bash,.zsh,.rs,.go,.java,.c,.cpp,.h,.hpp,.rb,.php,.r,.tex,.rst,.xml,.log,.env,.ini,.cfg,.conf,.pdf"
+                 multiple hidden>
+
+          <textarea id="user-input" placeholder="Digite sua mensagem ou comando (pressione Enter para enviar, Shift+Enter para nova linha)..." rows="1"></textarea>
+          <button id="btn-send" class="btn btn-primary">
+            <span>Enviar</span>
+            <span class="send-icon">➔</span>
+          </button>
+        </div>
+
+        <!-- Miniaturas das imagens prontas a enviar -->
+        <div class="image-strip" id="image-strip" hidden></div>
+        <!-- Badges dos ficheiros de texto anexados -->
+        <div class="file-strip" id="file-strip" hidden></div>
+        <!-- vision-warning sempre oculto (botão desativado já comunica) -->
+        <div class="vision-warning" id="vision-warning" hidden></div>
+
+        <!--
+          Barra de contagem de tokens. "Leitura" = o que o MODELO le: o contexto
+          da conversa mais a mensagem que estás a escrever agora (esta contada
+          pelo tokenizer real do modelo, via /api/tokenize). "Escrita" = o que o
+          modelo escreveu, na última resposta e somado na sessão.
+
+          O numero deixou de ser `caracteres // 4`: vem do `usage` que o
+          llama-server envia no fim de cada pedido (core.py:_capture_usage).
+        -->
+        <div class="token-bar" id="token-bar">
+          <span class="tok-group" title="O que o modelo lê: contexto da conversa + a mensagem que estás a escrever">
+            <span class="tok-ico">📖</span><span class="tok-label">Leitura</span>
+            <span class="tok-num" id="tok-read-ctx" title="Tokens do contexto (o último prompt enviado ao modelo)">0</span>
+            <span class="tok-plus">+</span>
+            <span class="tok-num" id="tok-read-msg" title="Tokens da mensagem que estás a escrever agora">0</span>
+            <span class="tok-unit">msg</span>
+          </span>
+
+          <span class="tok-group" title="O que o modelo escreveu">
+            <span class="tok-ico">✍️</span><span class="tok-label">Escrita</span>
+            <span class="tok-num" id="tok-write-last" title="Tokens gerados na última resposta">0</span>
+            <span class="tok-unit">última</span>
+            <span class="tok-plus">·</span>
+            <span class="tok-num" id="tok-write-session" title="Tokens gerados nesta sessão">0</span>
+            <span class="tok-unit">sessão</span>
+          </span>
+
+          <span class="tok-group tok-right">
+            <span id="tok-ctx" title="Uso da janela de contexto do modelo">contexto —</span>
+            <span class="tok-plus">·</span>
+            <span id="tok-speed" title="Velocidade medida pelo próprio servidor de inferência">— t/s</span>
+            <span class="tok-plus">·</span>
+            <span id="tok-cache" title="Parte do prompt servida do KV cache — é isto que torna o segundo turno muito mais rápido">♻ —</span>
+          </span>
+        </div>
+
+        <div class="input-hints">
+          <span>Use <strong>/btw &lt;nota&gt;</strong> para interromper/guiar raciocínio • Troque o modelo no menu superior sem perder o histórico</span>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

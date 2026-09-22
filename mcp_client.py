@@ -8,8 +8,15 @@ import json
 import asyncio
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in tests
+    ClientSession = None
+    StdioServerParameters = None
+    def stdio_client(*args, **kwargs):
+        raise ModuleNotFoundError("mcp package is not installed")
 
 DEFAULT_CONFIG_PATHS = [
     Path("mcp_config.json"),
@@ -21,6 +28,7 @@ class MCPManager:
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = self._resolve_config_path(config_path)
         self.servers: Dict[str, Dict[str, Any]] = {}
+        self.enabled_servers: List[str] = []
         self.discovered_tools: Dict[str, Any] = {}
         self.tool_to_server: Dict[str, Tuple[str, str]] = {}  # tool_alias -> (server_name, original_name)
         self.load_config()
@@ -40,19 +48,62 @@ class MCPManager:
                 return p
         return None
 
+    def _resolve_enabled_servers(self, all_servers: Dict[str, Dict[str, Any]]) -> List[str]:
+        selected = os.environ.get("APEX_MCP_SERVERS", "").strip()
+        if not selected:
+            return list(all_servers.keys())
+
+        names = []
+        for part in selected.replace(";", ",").split(","):
+            item = part.strip()
+            if item:
+                names.append(item)
+
+        filtered = [name for name in names if name in all_servers]
+        return filtered if filtered else list(all_servers.keys())
+
+    def set_enabled_servers(self, server_names: List[str]) -> List[str]:
+        """Set the allowed active MCP servers and return the final list."""
+        if not self.config_path or not self.config_path.exists():
+            return []
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            all_servers = data.get("mcpServers", {})
+            if not isinstance(all_servers, dict):
+                all_servers = {}
+            names = []
+            for raw in server_names or []:
+                for part in str(raw).replace(";", ",").split(","):
+                    item = part.strip()
+                    if item and item in all_servers:
+                        names.append(item)
+            normalized = list(dict.fromkeys(names))
+            os.environ["APEX_MCP_SERVERS"] = ",".join(normalized) if normalized else ""
+            self.load_config()
+            return self.enabled_servers
+        except Exception:
+            return []
+
     def load_config(self) -> Dict[str, Dict[str, Any]]:
         """Load configured MCP servers from JSON config."""
         self.servers = {}
+        self.enabled_servers = []
         if not self.config_path or not self.config_path.exists():
             return self.servers
 
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.servers = data.get("mcpServers", {})
+            all_servers = data.get("mcpServers", {})
+            if not isinstance(all_servers, dict):
+                all_servers = {}
+            self.enabled_servers = self._resolve_enabled_servers(all_servers)
+            self.servers = {name: all_servers[name] for name in self.enabled_servers if name in all_servers}
         except Exception as e:
             print(f"[MCP] Erro ao ler {self.config_path}: {e}")
             self.servers = {}
+            self.enabled_servers = []
         return self.servers
 
     def get_server_params(self, server_name: str) -> Optional[StdioServerParameters]:
@@ -83,14 +134,14 @@ class MCPManager:
                         await session.initialize()
                         tools_result = await session.list_tools()
                         return tools_result.tools
-        except Exception:
+        except BaseException:
             return []
 
     def discover_tools_for_server(self, server_name: str, timeout: float = 12.0) -> List[Dict[str, Any]]:
         """Synchronously discover tools for a single server."""
         try:
             raw_tools = asyncio.run(self._discover_tools_async(server_name, timeout=timeout))
-        except Exception:
+        except BaseException:
             raw_tools = []
 
         formatted = []

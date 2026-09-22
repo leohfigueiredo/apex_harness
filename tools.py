@@ -6,7 +6,7 @@ import re
 import html
 import json
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web using DuckDuckGo to get fresh information, documentation, news, or technical solutions."""
@@ -188,9 +188,39 @@ def write_file(path: str, content: str) -> str:
     """Create or overwrite a file with new content. Automatically creates parent directories."""
     try:
         p = Path(path).resolve()
+        from apex_harness.sandbox import get_sandbox_executor
+        sandbox = get_sandbox_executor()
+
+        # Check sandbox confinement if APEX_SANDBOX is enabled
+        if os.environ.get("APEX_SANDBOX", "0").lower() in ("1", "true", "yes"):
+            if not sandbox.is_path_safe(str(p)):
+                return f"Security Error: Attempted write outside designated workspace ({p}). Blocked by Sandbox."
+
+        diff = sandbox.generate_diff(str(p), content)
+
+        # Dry-run check
+        if sandbox.config.dry_run:
+            return f"[DRY-RUN] File write simulated for {p}.\n\nDiff Preview:\n{diff if diff else '(No changes)'}"
+
+        # Self-Critic check if APEX_CRITIC=1
+        if os.environ.get("APEX_CRITIC", "0").lower() in ("1", "true", "yes"):
+            from apex_harness.critic import run_critic
+            crit_res = run_critic(diff)
+            if not crit_res.approved:
+                return f"[CRITIC REJECTED] Review identified potential issues:\n{crit_res.feedback}\n\nOperation aborted."
+
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, 'w', encoding='utf-8') as f:
             f.write(content)
+
+        # Log touched file in session memory
+        try:
+            from apex_harness.session_memory import get_session_memory
+            sess_id = os.environ.get("APEX_SESSION_ID", "default_session")
+            get_session_memory().log_file_touched(sess_id, str(p))
+        except Exception:
+            pass
+
         return f"Successfully written {len(content)} characters to {p}"
     except Exception as e:
         return f"Error writing file '{path}': {str(e)}"
@@ -204,58 +234,99 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         with open(p, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
 
+        new_content = None
+
         # 1. Direct match
         if old_text in content:
             occurrences = content.count(old_text)
             if occurrences > 1:
                 return f"Warning: 'old_text' matched {occurrences} times. Please provide more surrounding lines for unique matching."
             new_content = content.replace(old_text, new_text, 1)
-            with open(p, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            return f"Successfully updated {p}"
 
         # 2. Line-ending normalized match (\r\n vs \n)
-        norm_content = content.replace('\r\n', '\n')
-        norm_old = old_text.replace('\r\n', '\n')
-        norm_new = new_text.replace('\r\n', '\n')
+        if new_content is None:
+            norm_content = content.replace('\r\n', '\n')
+            norm_old = old_text.replace('\r\n', '\n')
+            norm_new = new_text.replace('\r\n', '\n')
 
-        if norm_old in norm_content:
-            occurrences = norm_content.count(norm_old)
-            if occurrences > 1:
-                return f"Warning: 'old_text' matched {occurrences} times after newline normalization. Provide more context."
-            new_content = norm_content.replace(norm_old, norm_new, 1)
-            with open(p, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            return f"Successfully updated {p} (with newline normalization)"
+            if norm_old in norm_content:
+                occurrences = norm_content.count(norm_old)
+                if occurrences > 1:
+                    return f"Warning: 'old_text' matched {occurrences} times after newline normalization. Provide more context."
+                new_content = norm_content.replace(norm_old, norm_new, 1)
 
         # 3. Trailing-whitespace tolerant matching
-        content_lines = norm_content.splitlines()
-        old_lines = [l.rstrip() for l in norm_old.splitlines() if l.strip()]
-        
-        # Check if old_lines can be found ignoring trailing spaces
-        if old_lines:
-            matched_start = -1
-            match_len = len(old_lines)
-            for idx in range(len(content_lines) - match_len + 1):
-                window = [content_lines[idx + j].rstrip() for j in range(match_len)]
-                if window == old_lines:
-                    if matched_start != -1:
-                        return f"Warning: multiple fuzzy matches found in {p}. Please provide more unique context lines."
-                    matched_start = idx
+        if new_content is None:
+            norm_content = content.replace('\r\n', '\n')
+            norm_old = old_text.replace('\r\n', '\n')
+            norm_new = new_text.replace('\r\n', '\n')
+            content_lines = norm_content.splitlines()
+            old_lines = [l.rstrip() for l in norm_old.splitlines() if l.strip()]
+            
+            if old_lines:
+                matched_start = -1
+                match_len = len(old_lines)
+                for idx in range(len(content_lines) - match_len + 1):
+                    window = [content_lines[idx + j].rstrip() for j in range(match_len)]
+                    if window == old_lines:
+                        if matched_start != -1:
+                            return f"Warning: multiple fuzzy matches found in {p}. Please provide more unique context lines."
+                        matched_start = idx
 
-            if matched_start != -1:
-                replacement_lines = norm_new.splitlines()
-                updated_lines = content_lines[:matched_start] + replacement_lines + content_lines[matched_start + match_len:]
-                with open(p, 'w', encoding='utf-8') as f:
-                    f.write("\n".join(updated_lines) + ("\n" if content.endswith("\n") else ""))
-                return f"Successfully updated {p} (with whitespace-tolerant match)"
+                if matched_start != -1:
+                    replacement_lines = norm_new.splitlines()
+                    updated_lines = content_lines[:matched_start] + replacement_lines + content_lines[matched_start + match_len:]
+                    new_content = "\n".join(updated_lines) + ("\n" if content.endswith("\n") else "")
 
-        return f"Error: 'old_text' not found in {p}. Verify indentation, special characters and exact lines."
+        if new_content is None:
+            return f"Error: 'old_text' not found in {p}. Verify indentation, special characters and exact lines."
+
+        from apex_harness.sandbox import get_sandbox_executor
+        sandbox = get_sandbox_executor()
+
+        # Confinement check if APEX_SANDBOX is enabled
+        if os.environ.get("APEX_SANDBOX", "0").lower() in ("1", "true", "yes"):
+            if not sandbox.is_path_safe(str(p)):
+                return f"Security Error: Attempted edit outside designated workspace ({p}). Blocked by Sandbox."
+
+        diff = sandbox.generate_diff(str(p), new_content)
+
+        # Dry run check
+        if sandbox.config.dry_run:
+            return f"[DRY-RUN] File edit simulated for {p}.\n\nDiff Preview:\n{diff}"
+
+        # Self-Critic check if APEX_CRITIC=1
+        if os.environ.get("APEX_CRITIC", "0").lower() in ("1", "true", "yes"):
+            from apex_harness.critic import run_critic
+            crit_res = run_critic(diff)
+            if not crit_res.approved:
+                return f"[CRITIC REJECTED] Review identified potential issues:\n{crit_res.feedback}\n\nOperation aborted."
+
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+
+        # Log touched file in session memory
+        try:
+            from apex_harness.session_memory import get_session_memory
+            sess_id = os.environ.get("APEX_SESSION_ID", "default_session")
+            get_session_memory().log_file_touched(sess_id, str(p))
+        except Exception:
+            pass
+
+        return f"Successfully updated {p}"
     except Exception as e:
         return f"Error editing file '{path}': {str(e)}"
 
 def bash_exec(command: str, timeout: int = 60) -> str:
     """Execute a bash command in the terminal and return stdout + stderr."""
+    use_sandbox = os.environ.get("APEX_SANDBOX", "0").lower() in ("1", "true", "yes")
+    dry_run = os.environ.get("APEX_DRY_RUN", "0").lower() in ("1", "true", "yes")
+    if use_sandbox or dry_run:
+        from apex_harness.sandbox import get_sandbox_executor
+        executor = get_sandbox_executor()
+        res = executor.execute(command, timeout=timeout)
+        return res.to_tool_output()
+
     try:
         res = subprocess.run(
             ["/bin/bash", "-c", command],
@@ -388,6 +459,137 @@ def recall_memory(query: str, top_k: int = 5) -> str:
         return f"Error recalling memory: {str(e)}"
 
 
+def git_status(repo_path: str = ".") -> str:
+    """Show the working tree status of a git repository."""
+    try:
+        r_path = Path(repo_path).resolve()
+        res = subprocess.run(
+            ["git", "-C", str(r_path), "status", "--short", "--branch"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if res.returncode != 0:
+            return f"Git error (code {res.returncode}): {res.stderr.strip()}"
+        out = res.stdout.strip()
+        return out if out else "Working tree clean (no changes)."
+    except Exception as e:
+        return f"Error executing git status: {str(e)}"
+
+
+def git_diff(repo_path: str = ".", staged: bool = False, file_path: str = "") -> str:
+    """Show changes between commits, commit and working tree, etc."""
+    try:
+        r_path = Path(repo_path).resolve()
+        cmd = ["git", "-C", str(r_path), "diff"]
+        if staged:
+            cmd.append("--staged")
+        if file_path:
+            cmd.extend(["--", file_path])
+
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if res.returncode != 0:
+            return f"Git diff error (code {res.returncode}): {res.stderr.strip()}"
+        out = res.stdout
+        if not out:
+            return "No diff found (working tree matches index/target)."
+        if len(out) > 16000:
+            return out[:16000] + "\n\n... [Truncated: diff exceeded 16000 chars]"
+        return out
+    except Exception as e:
+        return f"Error executing git diff: {str(e)}"
+
+
+def git_log(repo_path: str = ".", n: int = 10) -> str:
+    """Show recent commit logs in a concise oneline format."""
+    try:
+        r_path = Path(repo_path).resolve()
+        res = subprocess.run(
+            ["git", "-C", str(r_path), "log", f"-n{n}", "--oneline", "--decorate"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if res.returncode != 0:
+            return f"Git log error (code {res.returncode}): {res.stderr.strip()}"
+        out = res.stdout.strip()
+        return out if out else "No commits found in repository."
+    except Exception as e:
+        return f"Error executing git log: {str(e)}"
+
+
+def git_branch(repo_path: str = ".", create: str = "", switch_to: str = "") -> str:
+    """List, create, or switch git branches."""
+    try:
+        r_path = Path(repo_path).resolve()
+        if create:
+            res = subprocess.run(["git", "-C", str(r_path), "checkout", "-b", create], capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return f"Git branch error: {res.stderr.strip()}"
+            return f"Created and switched to branch '{create}'."
+        elif switch_to:
+            res = subprocess.run(["git", "-C", str(r_path), "checkout", switch_to], capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return f"Git checkout error: {res.stderr.strip()}"
+            return f"Switched to branch '{switch_to}'."
+        else:
+            res = subprocess.run(["git", "-C", str(r_path), "branch", "-a"], capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return f"Git branch error: {res.stderr.strip()}"
+            return res.stdout.strip()
+    except Exception as e:
+        return f"Error executing git branch: {str(e)}"
+
+
+def git_commit(repo_path: str = ".", message: str = "", add_all: bool = False) -> str:
+    """Record changes to the repository."""
+    try:
+        if not message:
+            return "Error: Commit message cannot be empty."
+        r_path = Path(repo_path).resolve()
+        if add_all:
+            add_res = subprocess.run(["git", "-C", str(r_path), "add", "-A"], capture_output=True, text=True, timeout=15)
+            if add_res.returncode != 0:
+                return f"Git add error: {add_res.stderr.strip()}"
+
+        res = subprocess.run(["git", "-C", str(r_path), "commit", "-m", message], capture_output=True, text=True, timeout=15)
+        if res.returncode != 0:
+            return f"Git commit error (code {res.returncode}): {res.stderr.strip()}"
+        return res.stdout.strip()
+    except Exception as e:
+        return f"Error executing git commit: {str(e)}"
+
+
+def session_log(event_type: str, content: str) -> str:
+    """Log an architectural decision, touched file, open TODO, or note into persistent session memory."""
+    try:
+        from apex_harness.session_memory import get_session_memory
+        session_id = os.environ.get("APEX_SESSION_ID", "default_session")
+        mem = get_session_memory()
+        ev_id = mem.log_event(session_id=session_id, event_type=event_type, content=content)
+        return f"Successfully logged session event #{ev_id} ({event_type}): {content[:100]}"
+    except Exception as e:
+        return f"Error logging session event: {str(e)}"
+
+
+def consult_wiki(query: str, category: str = "") -> str:
+    """Search and read knowledge articles from the persistent WikiSkill repository."""
+    try:
+        from apex_harness.wikiskill import consult_wiki as _cw
+        return _cw(query=query, category=category if category else None)
+    except Exception as e:
+        return f"Error consulting wiki: {str(e)}"
+
+
+def record_wiki_skill(title: str, content: str, category: str = "workflows", tags: Optional[List[str]] = None) -> str:
+    """Save an architectural decision, workflow pattern, or hardware runbook into the persistent WikiSkill repository."""
+    try:
+        from apex_harness.wikiskill import record_wiki_skill as _rw
+        return _rw(title=title, content=content, category=category, tags=tags)
+    except Exception as e:
+        return f"Error recording wiki skill: {str(e)}"
+
+
 TOOLS_REGISTRY = {
     "web_search": web_search,
     "fetch_url": fetch_url,
@@ -400,6 +602,14 @@ TOOLS_REGISTRY = {
     "rag_search": rag_search,
     "rag_ingest": rag_ingest,
     "recall_memory": recall_memory,
+    "git_status": git_status,
+    "git_diff": git_diff,
+    "git_log": git_log,
+    "git_branch": git_branch,
+    "git_commit": git_commit,
+    "session_log": session_log,
+    "consult_wiki": consult_wiki,
+    "record_wiki_skill": record_wiki_skill,
 }
 
 TOOLS_DEFINITION = [
@@ -564,22 +774,181 @@ TOOLS_DEFINITION = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Show the working tree status of a git repository (branch and short status).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Path to git repository (default: current directory)."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "Show git diff between commits, staged changes, or working tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Path to git repository (default: current directory)."},
+                    "staged": {"type": "boolean", "description": "If true, view staged changes (--staged)."},
+                    "file_path": {"type": "string", "description": "Optional specific file path to diff."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "Show recent commit history in oneline decorated format.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Path to git repository (default: current directory)."},
+                    "n": {"type": "integer", "description": "Number of recent commits to display (default: 10)."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_branch",
+            "description": "List, create, or switch git branches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Path to git repository (default: current directory)."},
+                    "create": {"type": "string", "description": "Name of new branch to create and switch to."},
+                    "switch_to": {"type": "string", "description": "Name of existing branch to switch to."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_commit",
+            "description": "Record changes to the git repository with an explicit commit message.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Path to git repository (default: current directory)."},
+                    "message": {"type": "string", "description": "Commit message describing the changes."},
+                    "add_all": {"type": "boolean", "description": "If true, automatically stage all modified and new files (git add -A) before commit."}
+                },
+                "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_log",
+            "description": "Log an architectural decision, touched file, open TODO, or note into persistent session memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_type": {"type": "string", "enum": ["decision", "file_touched", "todo_open", "todo_done", "note"], "description": "Category of session event."},
+                    "content": {"type": "string", "description": "Text details of the event or decision."}
+                },
+                "required": ["event_type", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_wiki",
+            "description": "Search and read persistent WikiSkill articles, runbooks, architecture patterns, and hardware configurations accumulated from previous agent experiences.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword or topic to search in the persistent wiki."},
+                    "category": {"type": "string", "description": "Optional category filter (e.g., 'hardware', 'workflows', 'architecture', 'gotchas')."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_wiki_skill",
+            "description": "Compile and save a new skill card, solution pattern, or hardware runbook into the persistent Wiki knowledge base (arXiv:2608.27454).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Clear descriptive title of the skill/runbook."},
+                    "content": {"type": "string", "description": "Markdown body detailing context, steps, code patterns, and common gotchas."},
+                    "category": {"type": "string", "description": "Category: 'workflows', 'hardware', 'architecture', or 'gotchas'."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Search tags for discovery."}
+                },
+                "required": ["title", "content"]
+            }
+        }
     }
 ]
 
 def execute_tool(name: str, arguments: dict) -> str:
     """Execute a registered tool or MCP tool safely and return string output."""
+    import time
+    t0 = time.perf_counter()
+    status = "success"
+    result = ""
+
     if name.startswith("mcp_"):
         try:
             from apex_harness.mcp_client import get_mcp_manager
-            return get_mcp_manager().execute_mcp_tool(name, arguments)
+            result = get_mcp_manager().execute_mcp_tool(name, arguments)
         except Exception as e:
-            return f"Error executing MCP tool '{name}': {str(e)}"
+            status = "error"
+            result = f"Error executing MCP tool '{name}': {str(e)}"
+    elif name not in TOOLS_REGISTRY:
+        status = "error"
+        result = f"Error: Tool '{name}' is not recognized."
+    else:
+        try:
+            func = TOOLS_REGISTRY[name]
+            result = func(**arguments)
+        except Exception as e:
+            status = "error"
+            result = f"Error executing '{name}' with args {arguments}: {str(e)}"
 
-    if name not in TOOLS_REGISTRY:
-        return f"Error: Tool '{name}' is not recognized."
-    try:
-        func = TOOLS_REGISTRY[name]
-        return func(**arguments)
-    except Exception as e:
-        return f"Error executing '{name}' with args {arguments}: {str(e)}"
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Observability tracing (enabled unless explicitly APEX_TRACE=0)
+    if os.environ.get("APEX_TRACE", "1").lower() not in ("0", "false", "no"):
+        try:
+            from apex_harness.trace import get_trace_logger, TraceEvent
+            from datetime import datetime, timezone
+            sess_id = os.environ.get("APEX_SESSION_ID", "default_session")
+            args_repr = str(arguments)[:200]
+            res_repr = str(result)[:300]
+            tokens_in = max(1, len(args_repr) // 4)
+            tokens_out = max(1, len(res_repr) // 4)
+            ev = TraceEvent(
+                session_id=sess_id,
+                turn=0,
+                tool=name,
+                args_summary=args_repr,
+                result_summary=res_repr,
+                latency_ms=latency_ms,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                model=os.environ.get("APEX_MODEL", "local"),
+                ts=datetime.now(timezone.utc).isoformat(),
+                status=status
+            )
+            get_trace_logger().log_event(ev)
+        except Exception:
+            pass
+
+    return result

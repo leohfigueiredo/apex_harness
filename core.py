@@ -2,6 +2,7 @@ import os
 import re
 import json
 import httpx
+import urllib.request
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from openai import OpenAI
 from apex_harness.tools import TOOLS_DEFINITION, execute_tool, set_current_agent
@@ -13,14 +14,91 @@ Capabilities & Rules:
 2. OPERATING SYSTEM & CODING ACCESS: You have full access to inspect files (`list_dir`, `read_file`), make changes (`write_file`, `edit_file`), and execute terminal commands (`bash_exec`).
 3. HARDWARE AWARENESS: You are running on high-end hardware with 96GB RAM and ROCm/Vulkan acceleration. Be fast, precise, and practical.
 4. RIGOROUS EXECUTION: Always inspect files and verify directory contents before modifying them. When writing or editing code, ensure clean syntax and test your work with `bash_exec` whenever appropriate.
-
-Declarative Attention Protocol (DA):
-To maximise inference speed and reduce KV-cache pressure, declare your attention scope at the start of each reasoning step:
-- <global> — you need to reference earlier context (full attention required)
-- <focus:N> — you need only the last N messages (e.g. <focus:3> for the last 3 turns)
-- <local> — you only need the immediate prior message and your current output
-Use <local> by default for tool execution, code writing, and step-by-step tasks where prior conversation is not needed. Use <global> only when you must recall something from early in the session. This significantly reduces latency on long contexts.
+5. CONTINUITY: You keep the full conversation history. Always continue from what you have already done instead of restarting, and refer back to earlier steps, tool results and decisions even if they were many turns ago. If you are unsure whether you already did something, check rather than redo it.
 """
+
+# ---------------------------------------------------------------------------
+# Declarative Attention Protocol (DA) -- REMOVIDO, com o porque registado.
+#
+# O prompt de sistema instruia o modelo a declarar o seu "ambito de atencao"
+# no inicio de cada passo, com <global> / <focus:N> / <local>, alegando que
+# isso "significantly reduces latency on long contexts".
+#
+# Problema: NADA no codigo alguma vez leu essas marcas. Nao havia parser, nao
+# havia truncagem de historico, nao havia mecanismo nenhum -- era texto morto
+# na saida do modelo. Verificado com `grep -rn "focus:\\|<global>\\|<local>"`.
+#
+# E pior do que inutil: a instrucao diz literalmente
+#     "<local> -- you only need the immediate prior message and your current output"
+#     "Use <local> by default for tool execution, code writing..."
+# ou seja, pede ao modelo para AGIR como se nao tivesse acesso ao historico.
+# Num agente, isso produz exactamente o sintoma de "o modelo perde-se e nao
+# completa as tarefas": declara <local>, ignora o que leu e escreveu nos passos
+# anteriores, e recomeca em vez de continuar.
+#
+# A latencia que ele dizia resolver e hoje tratada onde realmente importa: a
+# cache KV do servidor, mantendo o prefixo do prompt estavel. Medido nesta
+# maquina: 46,2 s na 1a chamada contra 2,2 s nas seguintes (21x), e a
+# instabilidade do prefixo custava ~42 s POR TURNO.
+#
+# Se algum dia se quiser a funcionalidade a serio, tem de ser implementada:
+# ler o scope declarado na resposta e enviar de facto um historico truncado.
+# Nao basta pedi-lo no prompt.
+# ---------------------------------------------------------------------------
+DA_PROTOCOL = ""   # mantido vazio por compatibilidade; nao e injetado no prompt
+
+
+def estimate_token_throughput(
+    *,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    elapsed_seconds: float = 0.0,
+    cached_tokens: int = 0,
+    timings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
+    """Return prefill and decode throughput numbers.
+
+    Some local servers send `prompt_per_second` / `predicted_per_second` in the
+    final usage chunk, but others omit timings entirely. In that case, estimate
+    throughput from the actual elapsed time so the live terminal and status panel
+    keep updating during generation instead of staying at zero.
+    """
+    timings = timings or {}
+    if not isinstance(timings, dict):
+        timings = {}
+
+    def _float(name: str, default: float = 0.0) -> float:
+        try:
+            value = timings.get(name)
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError, AttributeError):
+            return default
+
+    prefill = _float("prompt_per_second", 0.0)
+    decode = _float("predicted_per_second", 0.0)
+
+    # If the upstream server did not include timings, fall back to a crude but
+    # useful estimate based on the last observed prompt/completion payload.
+    if elapsed_seconds <= 0:
+        elapsed_seconds = 0.001
+
+    if prefill <= 0 and prompt_tokens > 0:
+        effective_prompt = max(1, prompt_tokens - cached_tokens)
+        prefill = effective_prompt / elapsed_seconds
+
+    if decode <= 0 and completion_tokens > 0:
+        decode = completion_tokens / elapsed_seconds
+
+    return {
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "cached_tokens": int(cached_tokens),
+        "prefill_tps": round(max(0.0, prefill), 2),
+        "decode_tps": round(max(0.0, decode), 2),
+    }
+
 
 def extract_text_tool_calls(text: str) -> List[Tuple[str, dict]]:
     """Extract tool calls emitted as text/tags when local models don't use structured OpenAI output."""
@@ -73,6 +151,58 @@ REASONING_PROMPTS = {
     "off": "[Reasoning Effort: OFF] Disable internal thinking trace. Do NOT output <think> tags. Provide the final response directly."
 }
 
+def message_text(content: Any) -> str:
+    """
+    Achata o `content` de uma mensagem em texto simples.
+
+    Uma mensagem com imagem tem `content` como LISTA de blocos:
+        [{"type": "text", "text": "..."},
+         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]
+
+    Quem so quer o texto (contagem de tokens, arquivo para RAG, compactacao)
+    tem de passar por aqui -- `str(lista)` daria a representacao Python, com o
+    base64 inteiro dentro, que e lixo e enche o contexto.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        partes = []
+        for bloco in content:
+            if isinstance(bloco, dict):
+                if bloco.get("type") == "text":
+                    partes.append(str(bloco.get("text") or ""))
+                elif bloco.get("type") == "image_url":
+                    # Marcador curto: a imagem conta como presenca, nao como
+                    # milhares de caracteres de base64.
+                    partes.append("[imagem]")
+            elif isinstance(bloco, str):
+                partes.append(bloco)
+        return "\n".join(p for p in partes if p)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def detect_active_api_base(preferred: Optional[str] = None) -> str:
+    """Detect if llama-server (8080) or LM Studio (1234) is currently running."""
+    if preferred and "8080" not in preferred:
+        return preferred
+    env_base = os.environ.get("APEX_API_BASE")
+    if env_base and "8080" not in env_base:
+        return env_base
+
+    # Check 8080 first, then 1234
+    for port in [8080, 1234]:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models", headers={"User-Agent": "ApexHarness"})
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                if resp.status == 200:
+                    return f"http://127.0.0.1:{port}/v1"
+        except Exception:
+            pass
+
+    return env_base or "http://127.0.0.1:8080/v1"
+
 class ApexAgent:
     def __init__(
         self,
@@ -81,20 +211,76 @@ class ApexAgent:
         model_name: Optional[str] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         temperature: float = 0.2,
-        max_turns: int = 15,
+        #: Penalizacao de repeticao enviada ao llama-server.
+        #:
+        #: Existe por causa de um loop degenerativo real, observado em 18/09: o
+        #: modelo repetia "pode ajustar o curriculo..." seguido do mesmo plano em
+        #: ingles, indefinidamente, sem nunca produzir resposta.
+        #:
+        #: A causa era a combinacao de dois defaults:
+        #:   temperature 0.2  (o harness impoe isto; o servidor usa 0.8)
+        #:   repeat_penalty 1.0 = DESLIGADO, presence/frequency_penalty 0.0
+        #: Com quase-greedy e zero penalizacao, a sequencia repetida tem sempre a
+        #: probabilidade mais alta e nada empurra o modelo para fora do ciclo.
+        #:
+        #: Medido neste servidor, num prompt feito para induzir repeticao:
+        #:   sem penalizacao        2 repeticoes da mesma linha
+        #:   repeat_penalty=1.15    1 repeticao
+        #: 1.1 e suave de proposito: castiga o suficiente para quebrar o ciclo sem
+        #: estragar a repeticao legitima (codigo, nomes, listas).
+        repeat_penalty: float = 1.1,
         enable_mcp: bool = True,
-        reasoning_effort: str = "medium"
+        reasoning_effort: str = "medium",
+        # 15 era um teto baixo: tarefas reais de engenharia (ler -> editar ->
+        # testar -> corrigir) rebentavam com "Limite maximo de execucao de
+        # ferramentas atingido" a meio, deixando o trabalho por acabar.
+        # Configuravel por APEX_MAX_TURNS.
+        max_turns: Optional[int] = None,
+        # Manter o conjunto de ferramentas ESTAVEL entre turnos para a cache KV
+        # do servidor funcionar (ver _get_relevant_tools). Vale ~20x por turno.
+        stable_tools: bool = True,
     ):
-        self.base_url = base_url or os.environ.get("APEX_API_BASE", "http://127.0.0.1:8080/v1")
+        self.base_url = detect_active_api_base(base_url)
         self.api_key = api_key or os.environ.get("APEX_API_KEY", "no-key-required")
-        default_model = "llama-local-model" if "8080" in self.base_url else "local-model"
-        self.model_name = model_name or os.environ.get("APEX_MODEL", default_model)
+        if not model_name:
+            if "1234" in self.base_url:
+                default_model = "swift-qwen3.8-27b@q4_k_m"
+            elif "8080" in self.base_url:
+                default_model = "llama-local-model"
+            else:
+                default_model = "local-model"
+            self.model_name = os.environ.get("APEX_MODEL", default_model)
+        else:
+            self.model_name = model_name
         self._base_system_prompt = system_prompt
         self.reasoning_effort = (reasoning_effort or "medium").lower()
         self.system_prompt = self._compose_system_prompt()
         self.temperature = temperature
-        self.max_turns = max_turns
+        self.repeat_penalty = repeat_penalty
+        self.max_turns = max_turns if max_turns is not None else int(
+            os.environ.get("APEX_MAX_TURNS", "40")
+        )
+        self.stable_tools = stable_tools
         self._in_reasoning = False
+
+        # ------------------------------------------------------ contagem de tokens
+        # `stream_options={"include_usage": True}` faz o llama-server enviar um
+        # chunk final com `choices` VAZIO e `usage`/`timings` preenchidos. O loop
+        # de leitura descartava-o com `if not chunk.choices: continue`, e por isso
+        # a interface nunca soube os tokens reais -- mostrava `total_chars // 4`,
+        # que para portugues e para codigo erra bastante.
+        #
+        # Medido nesta maquina, num pedido de 8 tokens:
+        #   usage.prompt_tokens                        = 19
+        #   usage.completion_tokens                    =  8
+        #   usage.prompt_tokens_details.cached_tokens  = 14   <- veio do KV cache
+        #   model_extra['timings'] = {cache_n: 14, prompt_n: 5,
+        #                             prompt_per_second: 6.78, predicted_per_second: 2.67}
+        self.last_usage: Dict[str, Any] = {}
+        self.session_prompt_tokens = 0        # lidos pelo modelo, somados
+        self.session_completion_tokens = 0    # escritos pelo modelo, somados
+        self.session_cached_tokens = 0        # servidos do KV cache
+
         
         # Connect timeout: 5s is ample for a local 127.0.0.1 server; 15s just delays
         # error feedback when the server isn't up yet. Read stays long for prefill.
@@ -128,7 +314,7 @@ class ApexAgent:
                 for t in mcp_tools:
                     if not any(existing["function"]["name"] == t["function"]["name"] for existing in self.tools):
                         self.tools.append(t)
-        except Exception:
+        except BaseException:
             pass
 
     def _compose_system_prompt(self) -> str:
@@ -156,9 +342,79 @@ class ApexAgent:
             self.history[0]["content"] = self.system_prompt
         return f"Nível de raciocínio (effort) ajustado para: [bold green]{self.reasoning_effort.upper()}[/bold green]"
 
+    def set_model(self, new_model_name: str) -> str:
+        """Dynamically switch active LLM model mid-task without clearing history."""
+        old_model = self.model_name
+        clean_model = new_model_name.strip()
+        if not clean_model:
+            return f"Modelo inválido. Modelo atual permanece: '{old_model}'."
+        self.model_name = clean_model
+        return f"Modelo alterado com sucesso: de '{old_model}' ➔ '{self.model_name}'"
+
+    def inject_btw(self, note: str) -> str:
+        """Inject a high-priority side note (/btw) into conversation context mid-task."""
+        clean_note = note.strip()
+        if not clean_note:
+            return "Nota lateral vazia. Nenhuma alteração feita."
+        formatted_entry = f"[BY-THE-WAY / NOTA LATERAL DO USUÁRIO]: {clean_note}"
+        self.history.append({"role": "user", "content": formatted_entry})
+        return f"Nota lateral /btw injetada no contexto com sucesso: '{clean_note}'"
+
     def reset(self):
         """Reset conversation history back to the base system prompt."""
         self.history = [{"role": "system", "content": self.system_prompt}]
+
+    def _rag_db_path(self) -> str:
+        """Caminho da memoria vetorial de sessoes (o MESMO que o arquivo usa)."""
+        from pathlib import Path as _Path
+        return os.environ.get("APEX_RAG_DB", str(_Path.home() / ".apex_sessions" / "apex_rag.db"))
+
+    def _recall_from_rag(self, query: str, top_k: int = 4, max_chars: int = 2500) -> Optional[str]:
+        """
+        Recupera da memoria vetorial os trechos mais relevantes para `query`.
+
+        Isto e a metade que FALTAVA. O compact() arquivava o historico antigo na
+        RAG, mas `step()` nunca a consultava -- a memoria era so de escrita, o que
+        na pratica e o mesmo que nao existir: depois de uma compactacao o agente
+        ficava sem qualquer acesso ao que tinha feito antes. Era esta a razao de
+        "o modelo perder-se e nao completar as tarefas".
+
+        Devolve um bloco de texto pronto a injetar no contexto, ou None.
+        """
+        q = (query or "").strip()
+        if len(q) < 8:                      # saudacoes nao precisam de memoria
+            return None
+        try:
+            from pathlib import Path as _Path
+            db = self._rag_db_path()
+            if not _Path(db).exists() or _Path(db).stat().st_size < 8192:
+                return None                 # nada arquivado ainda
+
+            from apex_harness.rag.engine import ApexRAG
+            rag = ApexRAG(db_path=db)       # MESMA base que o _archive_messages_to_rag
+            hits = rag.search(query=q, mode="hybrid", top_k=top_k)
+            if not hits:
+                return None
+
+            blocks, total = [], 0
+            for h in hits:
+                txt = (h.get("content") or h.get("text") or "").strip()
+                if not txt:
+                    continue
+                if total + len(txt) > max_chars:
+                    txt = txt[: max(0, max_chars - total)]
+                if not txt:
+                    break
+                blocks.append(txt)
+                total += len(txt)
+                if total >= max_chars:
+                    break
+            if not blocks:
+                return None
+            return "\n\n---\n\n".join(blocks)
+        except Exception:
+            # Falha de recuperacao nunca deve partir a geracao.
+            return None
 
     def _archive_messages_to_rag(self, messages_to_archive: List[Dict[str, Any]]):
         """Archive compacted conversation messages to persistent RAG memory store."""
@@ -166,13 +422,22 @@ class ApexAgent:
             from apex_harness.rag.store import VectorStore
             from apex_harness.rag.embeddings import OllamaEmbedder
             
-            db_path = os.environ.get("APEX_RAG_DB", "apex_rag.db")
+            # CORRIGIDO: era o caminho RELATIVO "apex_rag.db", o que fazia com que
+            # cada pasta de trabalho criasse a sua propria memoria vetorial -- o
+            # agente "esquecia-se" ao mudar de projeto. Passa a viver num sitio
+            # estavel, ao lado da base de dados de sessoes.
+            from pathlib import Path as _Path
+            _default_db = str(_Path.home() / ".apex_sessions" / "apex_rag.db")
+            db_path = os.environ.get("APEX_RAG_DB", _default_db)
+            _Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             store = VectorStore(db_path)
             
             text_blocks = []
             for msg in messages_to_archive:
                 role = msg.get("role", "unknown")
-                cnt = msg.get("content") or ""
+                # message_text, nao str(): uma mensagem com imagem tem `content`
+                # como lista, e str(lista) enfiava o base64 inteiro no RAG.
+                cnt = message_text(msg.get("content"))
                 if cnt and isinstance(cnt, str):
                     text_blocks.append(f"[{role.upper()}]: {cnt[:2000]}")
                     
@@ -183,14 +448,28 @@ class ApexAgent:
             embedder = OllamaEmbedder()
             embeddings = embedder.get_embeddings_batch([full_text])
             if embeddings and len(embeddings) > 0 and len(embeddings[0]) > 0:
+                # CORRIGIDO: `VectorStore.add_chunks(doc_id, chunks, embeddings)` espera
+                # `chunks` como lista de DICIONARIOS com a chave "text", e NAO aceita
+                # um kwarg `metadatas`. O codigo antigo passava `chunks=[full_text]`
+                # (lista de strings) e `metadatas=[...]`, o que levantava TypeError.
+                # Como tudo isto estava dentro de `except Exception: pass`, o arquivo
+                # falhava EM SILENCIO: o compact() dizia "Historico arquivado em
+                # memoria RAG" enquanto gravava ZERO chunks, e as mensagens antigas
+                # eram descartadas de vez. Era esta a causa do agente "perder-se".
                 store.add_chunks(
                     doc_id="session_history",
-                    chunks=[full_text],
+                    chunks=[{
+                        "text": full_text,
+                        "metadata": {"source": "compact_archive", "doc_id": "session_history"},
+                    }],
                     embeddings=embeddings,
-                    metadatas=[{"source": "compact_archive", "doc_id": "session_history"}]
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            # Ja nao se engole em silencio: se o arquivo falhar, tem de se saber,
+            # porque o efeito e perda definitiva de contexto.
+            import sys as _sys
+            print(f"[APEX] AVISO: falha ao arquivar historico na memoria RAG: "
+                  f"{type(e).__name__}: {e}", file=_sys.stderr)
 
     def compact(self) -> str:
         """
@@ -205,7 +484,7 @@ class ApexAgent:
         """
         # Step 1 — truncate individual giants
         for msg in self.history:
-            cnt = msg.get("content")
+            cnt = message_text(msg.get("content"))
             if isinstance(cnt, str) and len(cnt) > 3000:
                 msg["content"] = cnt[:3000] + "\n... [Conteúdo longo truncado para preservar contexto]"
 
@@ -265,19 +544,49 @@ class ApexAgent:
 
     def auto_compact_if_needed(self, max_history_len: int = 16, max_estimated_tokens: int = 40000):
         """Prevent memory bloat by auto-compacting if history gets too long or large in token size."""
-        total_chars = sum(len(str(m.get("content") or "")) for m in self.history)
+        total_chars = sum(len(message_text(m.get("content"))) for m in self.history)
         if len(self.history) >= max_history_len or (total_chars // 3.5) >= max_estimated_tokens:
             self.compact()
 
     def _get_relevant_tools(self, user_text: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Pi-Harness Optimization: Sub-set Tool Pruning & Category Scoping.
-        Instead of sending all tool schemas (which inflates the KV cache by ~4000 tokens),
-        we dynamically filter to only the tool subset required for the user's intent.
+        Escolhe o conjunto de ferramentas a enviar ao modelo.
+
+        ATENCAO -- historico desta funcao, porque a versao anterior era uma
+        ANTI-OTIMIZACAO medida:
+
+        A ideia era podar os esquemas de ferramentas por intencao, para encolher
+        o prompt (~4000 tokens). O problema e que o conjunto mudava em TODOS os
+        turnos -- incluindo a lista de MCP, que era sempre anexada mas cujo
+        subconjunto variava. Como o prefixo do prompt (sistema + ferramentas)
+        mudava, o servidor nao conseguia reutilizar a cache KV e tinha de reler
+        os ~4000 tokens de raiz em cada turno.
+
+        Medido nesta maquina, contra o LM Studio, mesmo prompt e mesmo modelo:
+
+            prefixo ESTAVEL  1a chamada ............ 46,2 s
+            prefixo ESTAVEL  2a e 3a chamadas ......  2,2 s   (21x mais rapido)
+            prefixo MUDA     20 -> 16 ferramentas .. 44,4 s
+            prefixo MUDA     16 -> 12 ferramentas .. 41,2 s
+
+        Ou seja: poupar ~300 tokens de prompt custava ~42 s POR TURNO. A
+        estabilidade do prefixo vale muito mais do que o tamanho do prompt,
+        porque a cache torna o tamanho irrelevante a partir do 2o turno.
+
+        Solucao: por omissao devolvemos um conjunto ESTAVEL e deterministico
+        (todas as ferramentas, ordenadas por nome). O 1o turno paga o prompt
+        maior; todos os seguintes sao praticamente instantaneos.
+
+        `self.stable_tools = False` repoe o comportamento antigo, caso se queira
+        comparar.
         """
         if not self.tools:
             return None
-        
+
+        if self.stable_tools:
+            # Ordem deterministica: se a ordem mudasse, o prefixo mudava outra vez.
+            return sorted(self.tools, key=lambda t: t["function"]["name"])
+
         text_lower = user_text.lower().strip()
         
         # Conversational / Greetings / Short conceptual queries don't need tools
@@ -288,9 +597,12 @@ class ApexAgent:
         # Categorize tools by intent
         web_keywords = ["pesquise", "search", "busque", "procure", "google", "web", "url", "http", "https", "site"]
         file_keywords = ["leia", "read", "veja", "liste", "edite", "edit", "crie", "create", "escreva", "write", "arquivo", "file", "dir", "pasta", ".py", ".md", ".json", ".txt", ".sh", ".yaml"]
-        exec_keywords = ["execute", "rode", "bash", "terminal", "comando", "run", "teste", "test", "corrija", "fix", "git", "pip", "python", "pytest", "build", "make"]
+        exec_keywords = ["execute", "rode", "bash", "terminal", "comando", "run", "teste", "test", "corrija", "fix", "pip", "python", "pytest", "build", "make"]
+        git_keywords = ["git", "commit", "diff", "branch", "checkout", "status", "staged", "repo", "repositório"]
+        session_keywords = ["session", "sessão", "sessao", "todo", "tarefa", "decisão", "decisao", "note", "anotação"]
         rag_keywords = ["rag", "memory", "memoria", "lembrar", "recuperar", "historico", "recall", "busca no banco"]
         tdp_keywords = ["tdp", "pipeline", "arquitetura", "complex task", "tarefa complexa"]
+        wiki_keywords = ["wiki", "skill", "runbook", "conhecimento", "aprenda", "artigo", "documente"]
 
         matching_names = set()
 
@@ -300,10 +612,16 @@ class ApexAgent:
             matching_names.update(["read_file", "write_file", "edit_file", "list_dir"])
         if any(kw in text_lower for kw in exec_keywords):
             matching_names.update(["bash_exec", "read_file", "list_dir"])
+        if any(kw in text_lower for kw in git_keywords):
+            matching_names.update(["git_status", "git_diff", "git_log", "git_branch", "git_commit"])
+        if any(kw in text_lower for kw in session_keywords):
+            matching_names.update(["session_log", "recall_memory"])
         if any(kw in text_lower for kw in rag_keywords):
             matching_names.update(["rag_search", "rag_ingest", "recall_memory"])
         if any(kw in text_lower for kw in tdp_keywords):
             matching_names.update(["run_tdp_pipeline"])
+        if any(kw in text_lower for kw in wiki_keywords):
+            matching_names.update(["consult_wiki", "record_wiki_skill"])
 
         # Always include custom MCP tools if registered
         for tool in self.tools:
@@ -322,17 +640,117 @@ class ApexAgent:
         filtered = [t for t in self.tools if t["function"]["name"] in matching_names]
         return filtered if filtered else self.tools
 
+    def _capture_usage(self, chunk: Any, on_usage: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
+        """
+        Le o `usage`/`timings` que o llama-server manda no chunk final.
+
+        Tem de ser chamado ANTES do `if not chunk.choices: continue` do loop de
+        leitura -- esse chunk e exactamente o que traz a contagem, e era ele que
+        estava a ser descartado.
+        """
+        usage = getattr(chunk, "usage", None)
+        if usage is None:
+            return
+
+        def _i(obj: Any, nome: str) -> int:
+            try:
+                return int(getattr(obj, nome, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        prompt = _i(usage, "prompt_tokens")
+        completion = _i(usage, "completion_tokens")
+
+        cached = 0
+        det = getattr(usage, "prompt_tokens_details", None)
+        if det is not None:
+            cached = _i(det, "cached_tokens")
+
+        # `timings` nao faz parte do esquema OpenAI; o SDK guarda-o em model_extra.
+        timings = {}
+        extra = getattr(chunk, "model_extra", None) or {}
+        if isinstance(extra, dict):
+            timings = extra.get("timings") or {}
+        if not timings:
+            timings = getattr(chunk, "timings", None) or {}
+
+        if not cached:
+            cached = _i(timings, "cache_n") if isinstance(timings, dict) else 0
+
+        # Estimate throughput from the server timing payload when present; otherwise
+        # compute it from the elapsed generation window. This keeps the live token
+        # speed visible even if the upstream backend omits timings.
+        elapsed_seconds = 0.0
+        if isinstance(timings, dict):
+            for key in ("elapsed_time", "total_time", "time_seconds"):
+                value = timings.get(key)
+                if value is not None:
+                    try:
+                        elapsed_seconds = max(float(value), 0.0)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+        info = estimate_token_throughput(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            elapsed_seconds=elapsed_seconds or 1.0,
+            cached_tokens=cached,
+            timings=timings if isinstance(timings, dict) else {},
+        )
+
+        # Prompt_n = tokens que tiveram mesmo de ser processados agora; cache_n =
+        # tokens reaproveitados do KV cache. A soma da o prompt todo.
+        info["new_prompt_tokens"] = _i(timings, "prompt_n") if isinstance(timings, dict) else max(0, prompt - cached)
+
+        self.last_usage = info
+        self.session_prompt_tokens += prompt
+        self.session_completion_tokens += completion
+        self.session_cached_tokens += cached
+
+        if on_usage:
+            try:
+                on_usage(dict(info))
+            except Exception:
+                pass
+
     def step(
         self,
         user_input: str,
         on_tool_start: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_tool_finish: Optional[Callable[[str, str], None]] = None,
-        on_chunk: Optional[Callable[[str], None]] = None
+        on_chunk: Optional[Callable[[str], None]] = None,
+        on_usage: Optional[Callable[[Dict[str, Any]], None]] = None,
+        images: Optional[List[str]] = None
     ) -> str:
-        """Run a complete multi-turn tool resolution cycle with real-time token streaming and text-fallback tool calling."""
-        self.history.append({"role": "user", "content": user_input})
+        self._in_reasoning = False
+
+        # Recuperar da memoria vetorial o que foi arquivado em compactacoes
+        # anteriores. Inserido ANTES da mensagem do utilizador, para garantir
+        # que a conversa termina sempre com role: "user" (evita quebrar templates Jinja/OpenAI).
+        recalled = self._recall_from_rag(user_input)
+        if recalled:
+            self.history.append({
+                "role": "system",
+                "content": ("[MEMORIA DE SESSOES ANTERIORES - trechos recuperados do "
+                            "historico arquivado. Usa-os se forem relevantes para a "
+                            "tarefa atual; se nao forem, ignora-os.]\n\n" + recalled),
+            })
+
+        # Com imagens, o `content` passa a ser uma lista de blocos -- e o formato
+        # multimodal que o llama-server (mtmd) entende. Sem imagens fica string,
+        # para nao mexer em nada do que ja funciona.
+        if images:
+            blocos: List[Dict[str, Any]] = []
+            if user_input:
+                blocos.append({"type": "text", "text": user_input})
+            for img in images:
+                blocos.append({"type": "image_url", "image_url": {"url": img}})
+            self.history.append({"role": "user", "content": blocos})
+        else:
+            self.history.append({"role": "user", "content": user_input})
         self.auto_compact_if_needed()
-        
+
         # Pi-Harness: Sub-set tool pruning to accelerate prefill and maximize KV-cache hits
         active_tools = self._get_relevant_tools(user_input)
         
@@ -344,8 +762,15 @@ class ApexAgent:
                 "model": self.model_name,
                 "messages": self.history,
                 "temperature": self.temperature,
-                "stream": True
+                "stream": True,
+                # Sem isto o servidor nao manda contagem nenhuma. Ver _capture_usage.
+                "stream_options": {"include_usage": True},
             }
+            # `repeat_penalty` nao faz parte do esquema OpenAI -- e uma extensao do
+            # llama-server, portanto vai em `extra_body`. Ver a nota no __init__
+            # sobre o loop degenerativo que isto resolve.
+            if self.repeat_penalty and self.repeat_penalty > 1.0:
+                request_kwargs["extra_body"] = {"repeat_penalty": self.repeat_penalty}
             if active_tools:
                 request_kwargs["tools"] = active_tools
                 request_kwargs["tool_choice"] = "auto"
@@ -354,6 +779,23 @@ class ApexAgent:
                 stream = self.client.chat.completions.create(**request_kwargs)
             except Exception as e:
                 err_str = str(e).lower()
+
+                # Um backend que nao conheca `stream_options` recusaria o pedido
+                # TODO. A contagem de tokens e um extra, nao pode custar a
+                # resposta: tira-se o campo e tenta-se de novo, uma vez.
+                if "stream_options" in err_str or "include_usage" in err_str:
+                    request_kwargs.pop("stream_options", None)
+                    stream = self.client.chat.completions.create(**request_kwargs)
+                    err_str = ""
+
+                # Mesma logica para o `repeat_penalty`: e uma extensao do
+                # llama-server. Num backend que a recuse, cai-se para o pedido
+                # sem ela em vez de perder a resposta.
+                if err_str and ("repeat_penalty" in err_str or "extra_body" in err_str):
+                    request_kwargs.pop("extra_body", None)
+                    stream = self.client.chat.completions.create(**request_kwargs)
+                    err_str = ""
+
                 # Se excedeu o tamanho de contexto disponível no servidor, compacta e tenta de novo
                 if "exceeds the available context size" in err_str or ("context size" in err_str and "exceed" in err_str):
                     self.compact()
@@ -409,9 +851,18 @@ class ApexAgent:
                         return err_msg
 
             accumulated_content = []
+            # Guardado a parte: o raciocinio NAO entra no `full_text` normal (nao
+            # e resposta), mas tem de sobreviver para o caso de o modelo nao
+            # chegar a produzir resposta nenhuma. Ver o fim do loop.
+            accumulated_reasoning = []
             tool_calls_map = {}
 
             for chunk in stream:
+                # ANTES do `continue`: e este o chunk que traz `usage` e `timings`
+                # (vem com `choices` vazio). Descartado aqui, a contagem de tokens
+                # nunca chegava a interface.
+                self._capture_usage(chunk, on_usage)
+
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -423,6 +874,7 @@ class ApexAgent:
                         self._in_reasoning = True
                         if on_chunk:
                             on_chunk("<think>")
+                    accumulated_reasoning.append(reasoning)
                     if on_chunk:
                         on_chunk(reasoning)
                 
@@ -459,6 +911,22 @@ class ApexAgent:
                 if on_chunk:
                     on_chunk("</think>")
             full_text = "".join(accumulated_content)
+            reasoning_text = "".join(accumulated_reasoning).strip()
+
+            # Se o modelo produziu SO raciocinio, o `full_text` fica vazio.
+            #
+            # Um modelo de "thinking" servido pelo llama-server manda o pensamento
+            # em `delta.reasoning_content` e a resposta final em `delta.content`.
+            # Quando o modelo termina sem chegar a escrever `content` -- porque
+            # bateu num stop, porque se enganou no formato, ou porque gastou o
+            # orcamento de tokens a pensar -- o acumulador fica vazio.
+            #
+            # Antes isto deitava fora o raciocinio TODO e devolvia "resposta
+            # vazia": o utilizador perdia o trabalho e o turno morria, sem
+            # sequer ficar no historico. Agora o raciocinio e aproveitado como
+            # resposta, que e o melhor que ha para mostrar.
+            if not full_text.strip() and reasoning_text and not tool_calls_map:
+                full_text = f"<think>\n{reasoning_text}\n</think>"
 
             # If no structured tool calls were emitted, check for text-formatted tool calls
             if not tool_calls_map and full_text:
@@ -539,4 +1007,6 @@ class ApexAgent:
                     "content": result_str
                 })
 
-        return "Limite máximo de execução de ferramentas atingido (15 turnos)."
+        timeout_msg = "Limite máximo de execução de ferramentas atingido (15 turnos)."
+        self.history.append({"role": "assistant", "content": timeout_msg})
+        return timeout_msg

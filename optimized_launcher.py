@@ -95,9 +95,19 @@ def build_command(
         # when the OS evicts pages back to the slow medium mid-generation.
         # On fast disks (ext4/btrfs/NVMe), mmap+mlock is strictly better:
         # fast startup and still pinned against swap.
+        #
+        # NA PRATICA o mlock nao acontece: o hard limit de RLIMIT_MEMLOCK e
+        # 8192 KB e nao sobe sem root, entao o llama-server falha no primeiro
+        # buffer ("Cannot allocate memory / Try increasing RLIMIT_MEMLOCK") e
+        # segue em mmap normal. plan_server_command() deteta o limite e emite
+        # -lm mmap, para o plano nao anunciar uma fixacao que nao existe.
         load_mode="mlock" if on_slow_disk else "mmap+mlock",
-        # prio=2 (high) is safe on a single-user workstation without any
-        # special capabilities. Use prio=0 to restore OS-default scheduling.
+        # prio=2 nao chega a ser usado sem CAP_SYS_NICE: plan_server_command()
+        # verifica CapPrm bit 23 e omite o --prio quando a capacidade falta.
+        # Medido como utilizador normal, forcar o flag produzia
+        #   "failed to set thread priority 2 : Operation not permitted"
+        # 6180 vezes num unico log, sem alterar o escalonamento. Fica pedido aqui
+        # para o caso de o binario ter setcap; o hwtune decide se sai.
         prio=2,
         prio_batch=2,
     )
@@ -130,6 +140,7 @@ def launch_llama_server(
     backend: str = "auto",
     speculative: bool = True,
     verbose: bool = True,
+    log_to_file: bool = False,
 ) -> Tuple[subprocess.Popen, Any, str]:
     """
     Start llama-server with hardware-aware flags.
@@ -137,6 +148,9 @@ def launch_llama_server(
     Drop-in compatible with launcher_common.launch_llama_server: same positional
     signature (model_path, port, context, extra_args) and the same
     (proc, log_file, log_path) return tuple.
+
+    `log_to_file=True` sends the child's stdout straight to `log_path` instead of
+    to an OS pipe. Use it for callers that do NOT run a drain loop -- see below.
     """
     argv, env = build_command(
         model_path, port=port, context=context, extra_args=extra_args,
@@ -144,16 +158,52 @@ def launch_llama_server(
     )
 
     log_path = f"/tmp/llama-server-{port}.log"
-    log_file = open(log_path, "w")
 
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    if log_to_file:
+        # Ficheiro, NAO PIPE.
+        #
+        # Com stdout=PIPE e sem ninguem a ler, o llama-server enche os ~64 KiB do
+        # buffer do pipe durante o carregamento e a partir dai BLOQUEIA na
+        # escrita. Fica "a carregar" para sempre, o wait_for_server_ready
+        # desiste, o launcher abre o browser e sai -- e ao sair fecha o lado de
+        # leitura do pipe, portanto a linha de log seguinte da EPIPE e o
+        # servidor morre sem deixar rasto.
+        #
+        # Foi isto que fez o atalho "Apex Web Harness" parar o
+        # apex-backend.service as 15:50 e deixar a porta 8080 morta, com o
+        # harness a responder "offline" e o botao de enviar inutil. O atalho de
+        # terminal nao sofria disto porque chama stream_server_output() e drena
+        # o pipe; o do web nao chamava.
+        log_file = open(log_path, "ab", buffering=0)
+        proc = subprocess.Popen(
+            argv,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    else:
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+
+    # Warm start NPU manager in background if NPU is usable (parallel warm-up)
+    try:
+        from apex_harness.npu_detect import npu_available
+        from apex_harness.npu_backend import get_npu_manager
+        if npu_available().usable:
+            mgr = get_npu_manager()
+            if not mgr.is_running():
+                mgr.start(wait_ready=False)
+    except Exception:
+        pass
+
     return proc, log_file, log_path
 
 
@@ -170,7 +220,7 @@ def install(module: Any = None, **kwargs: Any) -> None:
 
     original = getattr(module, "launch_llama_server", None)
 
-    def _patched(model_path, port=8080, context=32768, extra_args=None):
+    def _patched(model_path, port=8080, context=32768, extra_args=None, **call_kwargs):
         # Preserve the flash-fork routing decision made by launcher_common.
         bin_path = DEFAULT_SERVER
         try:
@@ -178,9 +228,14 @@ def install(module: Any = None, **kwargs: Any) -> None:
                 bin_path = module.get_llama_server(model_path)
         except Exception:
             pass
+        # `**call_kwargs` (e nao so `**kwargs`) para que o chamador possa pedir
+        # log_to_file=True. Sem isto, um argumento novo passado pelo launcher
+        # rebentava com TypeError, o atalho engolia a excecao num `except
+        # Exception: print(...)` e o servidor simplesmente nao subia.
+        merged = {**kwargs, **call_kwargs}
         return launch_llama_server(
             model_path, port=port, context=context, extra_args=extra_args,
-            server_bin=bin_path, **kwargs,
+            server_bin=bin_path, **merged,
         )
 
     _patched.__wrapped_original__ = original      # type: ignore[attr-defined]
