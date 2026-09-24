@@ -754,11 +754,72 @@ document.addEventListener('DOMContentLoaded', () => {
                 ${s.message_count ? `<span>· ${s.message_count} msgs</span>` : ''}
               </div>
             </div>
-            <button class="btn-delete-session" title="Apagar sessão permanentemente" data-id="${s.id}">🗑️</button>
+            <div class="session-actions">
+              <button class="btn-rename-session" title="${currentLang === 'en' ? 'Rename conversation' : 'Renomear conversa'}" data-id="${s.id}">✏️</button>
+              <button class="btn-delete-session" title="${currentLang === 'en' ? 'Delete conversation' : 'Apagar conversa'}" data-id="${s.id}">🗑️</button>
+            </div>
           `;
 
-          item.querySelector('.session-info').addEventListener('click', () => {
-            selectSession(s.id);
+          const infoEl = item.querySelector('.session-info');
+          const titleSpan = item.querySelector('.session-title');
+          const renameBtn = item.querySelector('.btn-rename-session');
+
+          const startInlineRename = (e) => {
+            if (e) e.stopPropagation();
+            if (item.querySelector('.session-rename-input')) return;
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'session-rename-input';
+            input.value = s.summary || title;
+
+            let finished = false;
+            const commitRename = async () => {
+              if (finished) return;
+              finished = true;
+              const newTitle = input.value.trim();
+              if (newTitle && newTitle !== (s.summary || title)) {
+                titleSpan.textContent = newTitle;
+                titleSpan.style.display = '';
+                input.remove();
+                await renameSession(s.id, newTitle);
+              } else {
+                titleSpan.textContent = title;
+                titleSpan.style.display = '';
+                input.remove();
+              }
+            };
+
+            input.addEventListener('keydown', (ev) => {
+              if (ev.key === 'Enter') {
+                ev.preventDefault();
+                input.blur();
+              } else if (ev.key === 'Escape') {
+                ev.preventDefault();
+                finished = true;
+                titleSpan.textContent = title;
+                titleSpan.style.display = '';
+                input.remove();
+              }
+            });
+
+            input.addEventListener('blur', () => {
+              commitRename();
+            });
+
+            titleSpan.style.display = 'none';
+            infoEl.insertBefore(input, infoEl.firstChild);
+            input.focus();
+            input.select();
+          };
+
+          renameBtn.addEventListener('click', startInlineRename);
+          titleSpan.addEventListener('dblclick', startInlineRename);
+
+          infoEl.addEventListener('click', (e) => {
+            if (e.target.tagName !== 'INPUT') {
+              selectSession(s.id);
+            }
           });
 
           item.querySelector('.btn-delete-session').addEventListener('click', (e) => {
@@ -921,6 +982,23 @@ document.addEventListener('DOMContentLoaded', () => {
       loadSessions();
     } catch (err) {
       alert('Erro ao apagar sessão: ' + err.message);
+    }
+  }
+
+  async function renameSession(sessionId, newTitle) {
+    if (!sessionId || !newTitle) return;
+    try {
+      const res = await fetch('/api/session/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: sessionId, title: newTitle })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        loadSessions();
+      }
+    } catch (err) {
+      console.warn('Erro ao renomear sessão:', err);
     }
   }
 
@@ -1315,6 +1393,22 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       sendBtwNote(note);
+      return;
+    }
+
+    // Check if user typed /rename or /title
+    if (message.startsWith('/rename ') || message.startsWith('/title ') || message === '/rename' || message === '/title') {
+      const newTitle = message.replace(/^\/(rename|title)\s*/, '').trim();
+      userInput.value = '';
+      ajustarAlturaCaixa();
+      if (!newTitle) {
+        alert(currentLang === 'en' ? 'Provide a new name: /rename <title>' : 'Digite um novo nome: /rename <nome>');
+        return;
+      }
+      if (currentSessionId) {
+        await renameSession(currentSessionId, newTitle);
+        appendSystemNotification(`✏️ ${currentLang === 'en' ? 'Conversation renamed to' : 'Conversa renomeada para'}: <strong>${escapeHtml(newTitle)}</strong>`);
+      }
       return;
     }
 

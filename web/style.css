@@ -161,30 +161,52 @@ body {
   margin-top: 0.2rem;
 }
 
-.btn-delete-session {
+.session-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  opacity: 0.3;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
+}
+
+.session-item:hover .session-actions {
+  opacity: 1;
+}
+
+.btn-rename-session, .btn-delete-session {
   background: transparent;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 0.25rem 0.35rem;
+  padding: 0.2rem 0.3rem;
   border-radius: 4px;
-  font-size: 0.85rem;
-  opacity: 0.3;
+  font-size: 0.8rem;
   transition: all 0.15s;
-  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.session-item:hover .btn-delete-session {
-  opacity: 0.75;
+.btn-rename-session:hover {
+  color: var(--accent-cyan);
+  background: rgba(0, 212, 255, 0.15);
 }
 
 .btn-delete-session:hover {
-  opacity: 1 !important;
   color: #ef4444;
   background: rgba(239, 68, 68, 0.15);
+}
+
+.session-rename-input {
+  width: 100%;
+  background: var(--bg-card);
+  border: 1px solid var(--accent-cyan);
+  color: var(--text-main);
+  font-size: 0.82rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  outline: none;
 }
 
 .sidebar-footer {

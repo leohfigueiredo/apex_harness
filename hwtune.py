@@ -1180,6 +1180,11 @@ def plan_server_command(
 
     argv += ["--alias", opts.alias]
 
+    mmproj_file = find_mmproj(model_path)
+    if mmproj_file:
+        argv += ["--mmproj", mmproj_file]
+        notes.append(f"--mmproj {os.path.basename(mmproj_file)}: projetor de visão multimodal ativado.")
+
     # Preserva dois defaults de servidor do launcher original, para que esta
     # correção não altere silenciosamente o comportamento de quem fala com o
     # endpoint sem passar estes campos. Ver TuneOptions.temp / .n_predict.
