@@ -5,7 +5,14 @@ import httpx
 import urllib.request
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from openai import OpenAI
-from apex_harness.tools import TOOLS_DEFINITION, execute_tool, set_current_agent
+from apex_harness.tools import (
+    TOOLS_DEFINITION,
+    TOOLS_SNIPPETS,
+    compress_tool_output,
+    execute_tool,
+    set_current_agent,
+)
+from apex_harness.jev_decider import get_jev, JevPermit
 
 DEFAULT_SYSTEM_PROMPT = """You are Apex Harness, an autonomous, highly capable AI engineer and researcher running locally on an AMD Ryzen AI 9 HX 370 (Zen 5, 24 threads) with Radeon 890M GPU and 96GB Unified Memory.
 
@@ -15,6 +22,8 @@ Capabilities & Rules:
 3. HARDWARE AWARENESS: You are running on high-end hardware with 96GB RAM and ROCm/Vulkan acceleration. Be fast, precise, and practical.
 4. RIGOROUS EXECUTION: Always inspect files and verify directory contents before modifying them. When writing or editing code, ensure clean syntax and test your work with `bash_exec` whenever appropriate.
 5. CONTINUITY: You keep the full conversation history. Always continue from what you have already done instead of restarting, and refer back to earlier steps, tool results and decisions even if they were many turns ago. If you are unsure whether you already did something, check rather than redo it.
+
+{tools_snippets}
 """
 
 # ---------------------------------------------------------------------------
@@ -302,6 +311,15 @@ class ApexAgent:
 
         set_current_agent(self)
 
+        # Warm-up Jev in background so the first real ask_permit() hits a warm
+        # model. The future is intentionally discarded — we don't care about
+        # the result, only that the model loads its weights.
+        try:
+            _jev_warmup = get_jev().ask_permit("echo warmup")
+            # Don't block: let it run in the background thread pool
+        except Exception:
+            pass
+
     def _init_mcp(self):
         """Discover and append tools from configured MCP servers."""
         try:
@@ -318,11 +336,19 @@ class ApexAgent:
             pass
 
     def _compose_system_prompt(self) -> str:
-        prompt = self._base_system_prompt
+        # Tier-1: inject the snippet menu into the system prompt (stable, always
+        # cached after the first turn). If the template has a {tools_snippets}
+        # placeholder we fill it; otherwise we append the block at the end so
+        # existing custom prompts that don't have the placeholder still get it.
+        base = self._base_system_prompt
+        if "{tools_snippets}" in base:
+            base = base.format(tools_snippets=TOOLS_SNIPPETS)
+        else:
+            base = f"{base}\n\n{TOOLS_SNIPPETS}"
         effort_instr = REASONING_PROMPTS.get(self.reasoning_effort, "")
         if effort_instr:
-            prompt = f"{prompt}\n\n{effort_instr}"
-        return prompt
+            base = f"{base}\n\n{effort_instr}"
+        return base
 
     def set_reasoning_effort(self, effort: str) -> str:
         clean = effort.lower().strip()
@@ -363,6 +389,14 @@ class ApexAgent:
     def reset(self):
         """Reset conversation history back to the base system prompt."""
         self.history = [{"role": "system", "content": self.system_prompt}]
+
+    def load_history(self, messages: List[Dict[str, Any]]):
+        """Replace active conversation history with a provided message sequence."""
+        self.history = [{"role": "system", "content": self.system_prompt}]
+        for m in messages:
+            role = m.get("role")
+            if role in ("user", "assistant"):
+                self.history.append({"role": role, "content": m.get("content", "")})
 
     def _rag_db_path(self) -> str:
         """Caminho da memoria vetorial de sessoes (o MESMO que o arquivo usa)."""
@@ -751,10 +785,34 @@ class ApexAgent:
             self.history.append({"role": "user", "content": user_input})
         self.auto_compact_if_needed()
 
-        # Pi-Harness: Sub-set tool pruning to accelerate prefill and maximize KV-cache hits
-        active_tools = self._get_relevant_tools(user_input)
-        
+        # Tier-2 tool routing: launch Jev ask_tools in parallel NOW while we
+        # set up the rest of the turn. We resolve it just before the first LLM
+        # call — giving Jev the full turn latency to answer without adding
+        # any serial delay.
+        _tool_names = [t["function"]["name"] for t in self.tools]
+        if self.stable_tools:
+            # stable_tools=True: send all tools sorted (KV cache stability)
+            active_tools = self._get_relevant_tools(user_input)
+            _jev_tools_future = None
+        else:
+            # stable_tools=False: use Jev to pick the relevant subset
+            try:
+                _jev_tools_future = get_jev().ask_tools(user_input, _tool_names)
+            except Exception:
+                _jev_tools_future = None
+            active_tools = self._get_relevant_tools(user_input)  # keyword fallback
+
         turns = 0
+
+        # Resolve Jev tool-routing answer (it had the full setup time to run)
+        if not self.stable_tools and _jev_tools_future is not None:
+            try:
+                jev_names = _jev_tools_future.result(timeout=2.0)
+                if jev_names:
+                    from apex_harness.tools import get_tool_schemas_for
+                    active_tools = get_tool_schemas_for(jev_names, self.tools)
+            except Exception:
+                pass  # keep keyword fallback
 
         while turns < self.max_turns:
             turns += 1
@@ -983,19 +1041,44 @@ class ApexAgent:
                 if on_tool_start:
                     on_tool_start(name, args)
 
+                # Jev permission guard for bash_exec
+                # Runs synchronously (fast — Jev already warm) before execution.
+                # Behaviour:
+                #   allow → execute normally
+                #   ask   → proceed (interactive approval is out of scope here;
+                #            the on_tool_start callback can surface this to UI)
+                #   deny  → block and return a refusal string
+                if name == "bash_exec":
+                    cmd = args.get("command", "")
+                    try:
+                        permit_future = get_jev().ask_permit(cmd)
+                        permit: JevPermit = permit_future.result(timeout=6.0)
+                        if permit.verdict == "deny":
+                            block_msg = (
+                                f"[Jev DENY] Comando bloqueado por política de segurança.\n"
+                                f"Razão: {permit.reason}\n"
+                                f"Comando: {cmd[:200]}"
+                            )
+                            if on_tool_finish:
+                                on_tool_finish(name, block_msg)
+                            self.history.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": name,
+                                "content": block_msg,
+                            })
+                            continue
+                    except Exception:
+                        pass  # Jev unavailable → proceed normally
+
                 set_current_agent(self)
                 result_str = execute_tool(name, args)
-                # Pi-Harness: Head & Tail Scratchpad Truncation to protect KV-cache bandwidth while preserving stack traces
-                max_chars = 12000
-                if len(result_str) > max_chars:
-                    head_len = 5000
-                    tail_len = 5000
-                    truncated_count = len(result_str) - (head_len + tail_len)
-                    result_str = (
-                        result_str[:head_len] +
-                        f"\n\n... [{truncated_count} caracteres intermediários truncados pelo Apex Pi-Optimizer para preservar KV Cache] ...\n\n" +
-                        result_str[-tail_len:]
-                    )
+                # Tier-2 / Visibility Ladder: compress verbose tool outputs
+                # before they enter the history (and thus get re-sent every turn).
+                # compress_tool_output applies per-tool line limits:
+                #   bash_exec → 80 lines, read_file → 120 lines, etc.
+                # A truncation marker is appended so the model can ask for more.
+                result_str = compress_tool_output(name, result_str)
 
                 if on_tool_finish:
                     on_tool_finish(name, result_str)

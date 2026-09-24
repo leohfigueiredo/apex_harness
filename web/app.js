@@ -1,11 +1,15 @@
 document.addEventListener('DOMContentLoaded', () => {
   const modelSelect = document.getElementById('model-select');
   const effortSelect = document.getElementById('effort-select');
+  const mcpSelect = document.getElementById('mcp-select');
   const btnClear = document.getElementById('btn-clear');
   const btnNewChat = document.getElementById('btn-new-chat');
   const chatStream = document.getElementById('chat-stream');
   const userInput = document.getElementById('user-input');
   const btnSend = document.getElementById('btn-send');
+  const btnStop = document.getElementById('btn-stop');
+  const queueBanner = document.getElementById('queue-banner');
+  const queueText = document.getElementById('queue-text');
   
   const sessionsList = document.getElementById('sessions-list');
 
@@ -13,18 +17,31 @@ document.addEventListener('DOMContentLoaded', () => {
   const projectPath = document.getElementById('project-path');
   const btnChangeFolder = document.getElementById('btn-change-folder');
 
+  let currentSessionId = localStorage.getItem('apex_active_session_id') || '';
   let isGenerating = false;
   let currentAbortController = null;
   let generationStartedAt = 0;  // timestamp ms — para o watchdog detectar estado preso
+  let messageQueue = [];
+
+  function updateQueueBanner() {
+    if (!queueBanner || !queueText) return;
+    if (messageQueue.length > 0) {
+      queueBanner.style.display = 'flex';
+      queueText.textContent = `${messageQueue.length} mensagem${messageQueue.length > 1 ? 's' : ''} na fila (será enviada automaticamente a seguir)`;
+    } else {
+      queueBanner.style.display = 'none';
+    }
+  }
 
   function setGeneratingState(generating) {
     isGenerating = generating;
     generationStartedAt = generating ? Date.now() : 0;
+    if (btnStop) {
+      btnStop.style.display = generating ? 'flex' : 'none';
+    }
     if (generating) {
       btnSend.disabled = false;
-      btnSend.classList.add('btn-stop');
-      btnSend.innerHTML = '<span>Parar</span><span class="send-icon">⏹</span>';
-      btnSend.title = 'Interromper geração atual';
+      btnSend.title = 'Enviar mensagem para a fila (Enter)';
     } else {
       btnSend.disabled = false;
       btnSend.classList.remove('btn-stop');
@@ -34,9 +51,167 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  if (btnStop) {
+    btnStop.addEventListener('click', () => {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+      setGeneratingState(false);
+    });
+  }
+
+  // ── i18n Internationalization (EN / PT-BR) ──────────────────────────
+  const translations = {
+    pt: {
+      app_title: "Apex Harness — Web UI & Model Switcher",
+      new_chat: "Nova Conversa (/clear)",
+      monitor: "Monitor",
+      monitor_toggle: "Clique para expandir/recolher",
+      context: "Contexto",
+      context_badge: "📊 Contexto:",
+      decode: "Decode",
+      kv_cache: "Cache KV",
+      system_ram: "RAM Sistema",
+      read: "📖 Lido",
+      written: "✍ Escrito",
+      total: "∑ Total",
+      session_history: "Histórico de Sessões",
+      fetching_sessions: "Buscando sessões...",
+      empty_sessions: "Nenhuma sessão encontrada.",
+      change: "Alterar",
+      model: "🤖 Modelo:",
+      loading_models: "Carregando modelos...",
+      reasoning: "🧠 Raciocínio:",
+      effort_medium: "Médio ⚖️",
+      effort_low: "Baixo ⚡",
+      effort_high: "Alto 🧠",
+      effort_off: "Desligado 🚀",
+      tools: "🔌 Ferramentas:",
+      turbo_opt: "⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)",
+      all_opt: "🔌 Todos MCPs (Carregados)",
+      configure_btn: "⚙️ Configurar",
+      clear_context: "Limpar Contexto",
+      input_placeholder: "Digite sua mensagem ou comando (pressione Enter para enviar, Shift+Enter para nova linha)...",
+      send: "Enviar",
+      stop: "Parar",
+      reading: "Leitura",
+      writing: "Escrita",
+      last: "última",
+      session: "sessão",
+      hints: "Use <strong>/btw &lt;nota&gt;</strong> para interromper/guiar raciocínio • Troque o modelo no menu superior sem perder o histórico",
+      mcp_modal_title: "🔌 Gerenciador de Ferramentas MCP",
+      mcp_modal_desc: "Selecione quais servidores MCP deseja ativar. No <strong>Modo Turbo</strong>, todos os MCPs são desativados para reduzir o tamanho do prompt e acelerar a inferência.",
+      mcp_btn_turbo: "⚡ Modo Turbo (Desligar Todos)",
+      mcp_btn_all: "🔌 Selecionar Todos",
+      mcp_btn_save: "Salvar e Aplicar",
+      model_online: "Modelo: Online",
+      model_offline: "Modelo: Offline",
+      model_checking: "Modelo: Verificando...",
+      save_success: "✅ Configuração salva!",
+      saving: "Salvando...",
+      lang_flag: "🇧🇷",
+      lang_name: "PT"
+    },
+    en: {
+      app_title: "Apex Harness — Web UI & Model Switcher",
+      new_chat: "New Chat (/clear)",
+      monitor: "Monitor",
+      monitor_toggle: "Click to expand/collapse",
+      context: "Context",
+      context_badge: "📊 Context:",
+      decode: "Decode",
+      kv_cache: "KV Cache",
+      system_ram: "System RAM",
+      read: "📖 Read",
+      written: "✍ Written",
+      total: "∑ Total",
+      session_history: "Session History",
+      fetching_sessions: "Fetching sessions...",
+      empty_sessions: "No sessions found.",
+      change: "Change",
+      model: "🤖 Model:",
+      loading_models: "Loading models...",
+      reasoning: "🧠 Reasoning:",
+      effort_medium: "Medium ⚖️",
+      effort_low: "Low ⚡",
+      effort_high: "High 🧠",
+      effort_off: "Off 🚀",
+      tools: "🔌 Tools:",
+      turbo_opt: "⚡ Turbo Mode (No MCPs, ~4.2 t/s)",
+      all_opt: "🔌 All MCPs (Loaded)",
+      configure_btn: "⚙️ Configure",
+      clear_context: "Clear Context",
+      input_placeholder: "Type your message or command (press Enter to send, Shift+Enter for newline)...",
+      send: "Send",
+      stop: "Stop",
+      reading: "Read",
+      writing: "Write",
+      last: "last",
+      session: "session",
+      hints: "Use <strong>/btw &lt;note&gt;</strong> to steer reasoning • Switch models from top header without losing history",
+      mcp_modal_title: "🔌 MCP Tools Manager",
+      mcp_modal_desc: "Select which MCP servers to activate. In <strong>Turbo Mode</strong>, all MCPs are disabled to reduce prompt size and speed up inference.",
+      mcp_btn_turbo: "⚡ Turbo Mode (Disable All)",
+      mcp_btn_all: "🔌 Select All",
+      mcp_btn_save: "Save & Apply",
+      model_online: "Model: Online",
+      model_offline: "Model: Offline",
+      model_checking: "Model: Checking...",
+      save_success: "✅ Settings saved!",
+      saving: "Saving...",
+      lang_flag: "🇺🇸",
+      lang_name: "EN"
+    }
+  };
+
+  let currentLang = localStorage.getItem('apex_lang') || 'pt';
+
+  function applyLanguage(lang) {
+    currentLang = lang;
+    localStorage.setItem('apex_lang', lang);
+    const dict = translations[lang] || translations.pt;
+
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const key = el.getAttribute('data-i18n');
+      if (dict[key]) {
+        el.innerHTML = dict[key];
+      }
+    });
+
+    document.querySelectorAll('[data-i18n-title]').forEach(el => {
+      const key = el.getAttribute('data-i18n-title');
+      if (dict[key]) {
+        el.title = dict[key];
+      }
+    });
+
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+      const key = el.getAttribute('data-i18n-placeholder');
+      if (dict[key]) {
+        el.placeholder = dict[key];
+      }
+    });
+
+    const langFlag = document.getElementById('lang-flag');
+    const langText = document.getElementById('lang-text');
+    if (langFlag) langFlag.textContent = dict.lang_flag;
+    if (langText) langText.textContent = dict.lang_name;
+  }
+
+  const btnLangToggle = document.getElementById('btn-lang-toggle');
+  if (btnLangToggle) {
+    btnLangToggle.addEventListener('click', () => {
+      const nextLang = currentLang === 'pt' ? 'en' : 'pt';
+      applyLanguage(nextLang);
+    });
+  }
+
   // Initialize Web UI
+  applyLanguage(currentLang);
   loadProject();
   loadModels();
+  loadMcp();
   loadSessions();
   loadStatus();
   setInterval(loadStatus, 4000);
@@ -180,15 +355,16 @@ document.addEventListener('DOMContentLoaded', () => {
       const ctxText = document.getElementById('context-load-text');
 
       if (dot && modelText && data.status !== undefined) {
+        const isEn = currentLang === 'en';
         if (data.status === 'ready' && data.model_loaded_pct === 100) {
           dot.className = 'dot green';
-          modelText.textContent = `Modelo: 100% Carregado`;
+          modelText.textContent = isEn ? 'Model: 100% Loaded' : 'Modelo: 100% Carregado';
         } else if (data.status === 'loading') {
           dot.className = 'dot yellow';
-          modelText.textContent = `Modelo: Carregando...`;
+          modelText.textContent = isEn ? 'Model: Loading...' : 'Modelo: Carregando...';
         } else {
           dot.className = 'dot red';
-          modelText.textContent = `Modelo: Não Carregado (0%)`;
+          modelText.textContent = isEn ? 'Model: Offline (0%)' : 'Modelo: Não Carregado (0%)';
         }
       }
       if (ctxText && data.context_pct !== undefined) {
@@ -339,22 +515,220 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Clear Context Event
-  btnClear.addEventListener('click', clearChat);
-  btnNewChat.addEventListener('click', clearChat);
+  // Clear Context & New Chat Events
+  btnClear.addEventListener('click', () => startNewSession(true));
+  btnNewChat.addEventListener('click', () => startNewSession(true));
 
-  async function clearChat() {
+  let cachedMcpData = null;
+
+  async function loadMcp() {
+    if (!mcpSelect) return;
     try {
-      await fetch('/api/clear', { method: 'POST' });
-      chatStream.innerHTML = `
-        <div class="welcome-card">
-          <h2>⚡ Apex Harness — Novo Tópico Iniciado</h2>
-          <p>Contexto e histórico da conversa foram reiniciados.</p>
-        </div>
-      `;
+      const res = await fetch('/api/mcp');
+      const data = await res.json();
+      cachedMcpData = data;
+      mcpSelect.innerHTML = '';
+
+      const optTurbo = document.createElement('option');
+      optTurbo.value = 'turbo';
+      optTurbo.textContent = '⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)';
+      mcpSelect.appendChild(optTurbo);
+
+      const optAll = document.createElement('option');
+      optAll.value = 'all';
+      const count = (data.available_servers || []).length;
+      optAll.textContent = `🔌 Todos MCPs (${count} servidores)`;
+      mcpSelect.appendChild(optAll);
+
+      if (data.available_servers && data.available_servers.length > 0) {
+        const group = document.createElement('optgroup');
+        group.label = 'Servidor específico';
+        data.available_servers.forEach(s => {
+          const opt = document.createElement('option');
+          opt.value = `server:${s}`;
+          opt.textContent = `📦 Só ${s}`;
+          group.appendChild(opt);
+        });
+        mcpSelect.appendChild(group);
+      }
+
+      if (data.mode === 'turbo') {
+        mcpSelect.value = 'turbo';
+      } else if (data.mode === 'all') {
+        mcpSelect.value = 'all';
+      } else if (data.enabled_servers && data.enabled_servers.length === 1) {
+        mcpSelect.value = `server:${data.enabled_servers[0]}`;
+      } else {
+        mcpSelect.value = 'all';
+      }
+
+      renderMcpChecklist(data);
     } catch (err) {
-      alert('Erro ao limpar contexto: ' + err.message);
+      console.warn('Erro ao carregar MCPs:', err);
     }
+  }
+
+  function renderMcpChecklist(data) {
+    const list = document.getElementById('mcp-servers-checklist');
+    if (!list || !data || !data.available_servers) return;
+    list.innerHTML = '';
+
+    const enabledSet = new Set(data.mode === 'turbo' ? [] : (data.enabled_servers || []));
+
+    data.available_servers.forEach(serverName => {
+      const item = document.createElement('label');
+      item.className = 'mcp-item';
+
+      const left = document.createElement('div');
+      left.className = 'mcp-item-left';
+
+      const chk = document.createElement('input');
+      chk.type = 'checkbox';
+      chk.value = serverName;
+      chk.checked = enabledSet.has(serverName);
+
+      const label = document.createElement('span');
+      label.className = 'mcp-item-name';
+      label.textContent = serverName;
+
+      left.appendChild(chk);
+      left.appendChild(label);
+
+      const badge = document.createElement('span');
+      badge.className = 'mcp-item-badge';
+      badge.textContent = 'MCP Server';
+
+      item.appendChild(left);
+      item.appendChild(badge);
+      list.appendChild(item);
+    });
+  }
+
+  const btnOpenMcpModal = document.getElementById('btn-open-mcp-modal');
+  const btnCloseMcpModal = document.getElementById('btn-close-mcp-modal');
+  const mcpModal = document.getElementById('mcp-modal');
+  const btnMcpTurbo = document.getElementById('btn-mcp-turbo');
+  const btnMcpAll = document.getElementById('btn-mcp-all');
+  const btnSaveMcp = document.getElementById('btn-save-mcp');
+  const mcpModalStatus = document.getElementById('mcp-modal-status');
+
+  if (btnOpenMcpModal && mcpModal) {
+    btnOpenMcpModal.addEventListener('click', () => {
+      if (cachedMcpData) renderMcpChecklist(cachedMcpData);
+      mcpModal.style.display = 'flex';
+      if (mcpModalStatus) mcpModalStatus.textContent = '';
+    });
+  }
+
+  if (btnCloseMcpModal && mcpModal) {
+    btnCloseMcpModal.addEventListener('click', () => {
+      mcpModal.style.display = 'none';
+    });
+  }
+
+  if (mcpModal) {
+    mcpModal.addEventListener('click', (e) => {
+      if (e.target === mcpModal) {
+        mcpModal.style.display = 'none';
+      }
+    });
+  }
+
+  if (btnMcpTurbo) {
+    btnMcpTurbo.addEventListener('click', () => {
+      const chks = document.querySelectorAll('#mcp-servers-checklist input[type="checkbox"]');
+      chks.forEach(c => c.checked = false);
+    });
+  }
+
+  if (btnMcpAll) {
+    btnMcpAll.addEventListener('click', () => {
+      const chks = document.querySelectorAll('#mcp-servers-checklist input[type="checkbox"]');
+      chks.forEach(c => c.checked = true);
+    });
+  }
+
+  if (btnSaveMcp) {
+    btnSaveMcp.addEventListener('click', async () => {
+      const chks = Array.from(document.querySelectorAll('#mcp-servers-checklist input[type="checkbox"]'));
+      const checkedServers = chks.filter(c => c.checked).map(c => c.value);
+
+      let payload = {};
+      if (checkedServers.length === 0) {
+        payload = { mode: 'turbo' };
+      } else if (checkedServers.length === chks.length) {
+        payload = { mode: 'all' };
+      } else {
+        payload = { mode: 'custom', servers: checkedServers };
+      }
+
+      if (mcpModalStatus) mcpModalStatus.textContent = 'Salvando...';
+
+      try {
+        const res = await fetch('/api/mcp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await res.json();
+        if (mcpModalStatus) mcpModalStatus.textContent = '✅ Configuração salva!';
+        await loadMcp();
+        setTimeout(() => {
+          if (mcpModal) mcpModal.style.display = 'none';
+        }, 600);
+      } catch (err) {
+        if (mcpModalStatus) mcpModalStatus.textContent = '❌ Erro: ' + err.message;
+      }
+    });
+  }
+
+  if (mcpSelect) {
+    mcpSelect.addEventListener('change', async () => {
+      const val = mcpSelect.value;
+      let payload = {};
+      if (val === 'turbo') {
+        payload = { mode: 'turbo' };
+      } else if (val === 'all') {
+        payload = { mode: 'all' };
+      } else if (val.startsWith('server:')) {
+        const serverName = val.substring(7);
+        payload = { mode: 'custom', servers: [serverName] };
+      }
+      try {
+        const res = await fetch('/api/mcp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const d = await res.json();
+        if (d.message) {
+          console.log('[MCP]', d.message);
+        }
+        await loadMcp();
+      } catch (err) {
+        alert('Erro ao alterar MCP: ' + err.message);
+      }
+    });
+  }
+
+  function formatSessionDate(isoStr) {
+    if (!isoStr) return '';
+    try {
+      const d = new Date(isoStr);
+      if (isNaN(d.getTime())) return isoStr;
+      const hoje = new Date();
+      if (d.toDateString() === hoje.toDateString()) {
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+      return d.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (e) {
+      return isoStr;
+    }
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   // Load Session History
@@ -366,16 +740,187 @@ document.addEventListener('DOMContentLoaded', () => {
       if (data.sessions && data.sessions.length > 0) {
         data.sessions.forEach(s => {
           const item = document.createElement('div');
-          item.className = 'session-item';
-          const title = s.summary || `Sessão ${s.id.substring(0, 8)}`;
-          item.innerHTML = `<strong>${title}</strong><br><small style="color:#94a3b8">${s.started_at || ''}</small>`;
+          item.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
+          item.dataset.id = s.id;
+
+          const title = s.summary || `Sessão ${s.id.substring(5, 13)}`;
+          const dateStr = s.last_active ? formatSessionDate(s.last_active) : (s.started_at ? formatSessionDate(s.started_at) : '');
+
+          item.innerHTML = `
+            <div class="session-info" title="${escapeHtml(title)}">
+              <span class="session-title">${escapeHtml(title)}</span>
+              <div class="session-meta">
+                <span>${dateStr}</span>
+                ${s.message_count ? `<span>· ${s.message_count} msgs</span>` : ''}
+              </div>
+            </div>
+            <button class="btn-delete-session" title="Apagar sessão permanentemente" data-id="${s.id}">🗑️</button>
+          `;
+
+          item.querySelector('.session-info').addEventListener('click', () => {
+            selectSession(s.id);
+          });
+
+          item.querySelector('.btn-delete-session').addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteSession(s.id);
+          });
+
           sessionsList.appendChild(item);
         });
+
+        // Se currentSessionId não existe na lista, seleciona a primeira da lista
+        if (!currentSessionId || !data.sessions.some(s => s.id === currentSessionId)) {
+          const initialId = (data.current_session_id && data.sessions.some(s => s.id === data.current_session_id))
+            ? data.current_session_id
+            : data.sessions[0].id;
+          selectSession(initialId);
+        }
       } else {
-        sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#94a3b8">Nenhuma sessão salva no banco.</div>';
+        sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#94a3b8">Nenhuma sessão salva no banco ou disco (~/.apex_sessions/sessions/).</div>';
+        if (!currentSessionId) {
+          startNewSession(false);
+        }
       }
     } catch (err) {
-      sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#94a3b8">Erro ao carregar sessões.</div>';
+      sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#ef4444">Erro ao carregar sessões.</div>';
+    }
+  }
+
+  async function selectSession(sessionId) {
+    if (!sessionId) return;
+    currentSessionId = sessionId;
+    localStorage.setItem('apex_active_session_id', sessionId);
+
+    document.querySelectorAll('.session-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.id === sessionId);
+    });
+
+    try {
+      const res = await fetch('/api/session/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: sessionId })
+      });
+      const data = await res.json();
+      if (data.session) {
+        renderSessionMessages(data.session.messages || []);
+      }
+    } catch (err) {
+      console.warn('Erro ao carregar mensagens da sessão:', err);
+    }
+  }
+
+  function renderSessionMessages(messages) {
+    chatStream.innerHTML = '';
+    if (!messages || messages.length === 0) {
+      chatStream.innerHTML = `
+        <div class="welcome-card">
+          <h2>⚡ Apex Harness Web Interface</h2>
+          <p>Sessão vazia. Digite sua mensagem ou comando abaixo para começar.</p>
+          <div class="feature-tags">
+            <span class="tag">💡 Interrupção /btw</span>
+            <span class="tag">🔄 Model Hot-Swap</span>
+            <span class="tag">🧠 Reasoning Traces</span>
+            <span class="tag">💾 Session Memory</span>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    messages.forEach(m => {
+      if (m.role === 'user') {
+        const isBtw = (m.content || '').startsWith('[BY-THE-WAY');
+        const text = isBtw ? m.content.replace(/^\[BY-THE-WAY[^\]]*\]:\s*/, '') : m.content;
+        appendUserMessage(text, isBtw);
+      } else if (m.role === 'assistant') {
+        appendHistoricalAssistantMessage(m.content);
+      }
+    });
+
+    chatStream.scrollTop = chatStream.scrollHeight;
+  }
+
+  function appendHistoricalAssistantMessage(fullText) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = 'message assistant';
+
+    const roleDiv = document.createElement('div');
+    roleDiv.className = 'message-role';
+    roleDiv.innerHTML = '🤖 Apex Harness';
+
+    const bubbleDiv = document.createElement('div');
+    bubbleDiv.className = 'message-bubble';
+
+    let textToRender = fullText || '';
+    const thinkMatch = textToRender.match(/<think>([\s\S]*?)<\/think>/);
+    if (thinkMatch) {
+      const thinkText = thinkMatch[1].trim();
+      textToRender = textToRender.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+
+      const details = document.createElement('details');
+      details.className = 'think-block';
+      details.open = false;
+      const summary = document.createElement('summary');
+      summary.textContent = '🧠 Pensamento e Raciocínio (Trace)';
+      details.appendChild(summary);
+
+      const thinkContent = document.createElement('div');
+      thinkContent.className = 'think-content';
+      thinkContent.textContent = thinkText;
+      details.appendChild(thinkContent);
+      bubbleDiv.appendChild(details);
+    }
+
+    const textDiv = document.createElement('div');
+    textDiv.className = 'assistant-text';
+    textDiv.innerHTML = window.marked ? marked.parse(textToRender) : textToRender;
+    bubbleDiv.appendChild(textDiv);
+
+    msgDiv.appendChild(roleDiv);
+    msgDiv.appendChild(bubbleDiv);
+    chatStream.appendChild(msgDiv);
+  }
+
+  async function startNewSession(refreshUI = true) {
+    if (isGenerating) {
+      if (!confirm('Uma resposta está a ser gerada. Deseja iniciar uma nova conversa mesmo assim?')) return;
+      if (currentAbortController) currentAbortController.abort();
+      setGeneratingState(false);
+    }
+    try {
+      const res = await fetch('/api/session/new', { method: 'POST' });
+      const data = await res.json();
+      currentSessionId = data.session_id;
+      localStorage.setItem('apex_active_session_id', currentSessionId);
+      renderSessionMessages([]);
+      if (refreshUI) {
+        loadSessions();
+      }
+      userInput.focus();
+    } catch (err) {
+      alert('Erro ao criar nova sessão: ' + err.message);
+    }
+  }
+
+  async function deleteSession(sessionId) {
+    if (!confirm('Deseja apagar esta sessão permanentemente do disco e da memória?')) return;
+    try {
+      const res = await fetch('/api/session/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: sessionId })
+      });
+      const data = await res.json();
+      if (sessionId === currentSessionId) {
+        currentSessionId = data.active_session_id || '';
+        localStorage.setItem('apex_active_session_id', currentSessionId);
+        selectSession(currentSessionId);
+      }
+      loadSessions();
+    } catch (err) {
+      alert('Erro ao apagar sessão: ' + err.message);
     }
   }
 
@@ -764,21 +1309,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (message.startsWith('/btw ') || message.startsWith('/btw')) {
       const note = message.replace(/^\/btw\s*/, '').trim();
       userInput.value = '';
+      ajustarAlturaCaixa();
       if (!note) {
         alert('Digite uma nota para o comando /btw');
         return;
       }
       sendBtwNote(note);
-      return;
-    }
-
-    // Se já estiver gerando e o usuário clicar no botão, interpreta como Stop/Interromper
-    if (isGenerating) {
-      if (currentAbortController) {
-        currentAbortController.abort();
-        currentAbortController = null;
-      }
-      setGeneratingState(false);
       return;
     }
 
@@ -794,13 +1330,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // As imagens só vão no primeiro envio
     const imagensAEnviar = pendingImages.map((i) => i.url);
+    const filesAnexados = pendingTextFiles.slice();
 
     userInput.value = '';
     ajustarAlturaCaixa();
     porNumero(tokEls.msg, 0);
     limparImagens();
-    // Limpar ficheiros de texto anexados
-    const filesAnexados = pendingTextFiles.slice();
     pendingTextFiles = [];
     renderFileStrip();
 
@@ -808,10 +1343,31 @@ document.addEventListener('DOMContentLoaded', () => {
     const labelMsg = [
       filesAnexados.length ? `[${filesAnexados.length} ficheiro(s): ${filesAnexados.map(f => f.name).join(', ')}]` : '',
       message,
-    ].filter(Boolean).join('  ');
-    appendUserMessage(labelMsg || (imagensAEnviar.length ? '[imagem]' : ''), false);
+    ].filter(Boolean).join('  ') || (imagensAEnviar.length ? '[imagem]' : '');
 
-    // Inicializa AbortController para permitir cancelamento manual ou por timeout
+    // Se já estiver gerando, coloca NA FILA! Não cancela a resposta anterior!
+    if (isGenerating) {
+      messageQueue.push({
+        finalMessage,
+        imagensAEnviar,
+        filesAnexados,
+        labelMsg
+      });
+      updateQueueBanner();
+      return;
+    }
+
+    await dispatchMessage({ finalMessage, imagensAEnviar, filesAnexados, labelMsg });
+  }
+
+  async function dispatchMessage({ finalMessage, imagensAEnviar, filesAnexados, labelMsg }) {
+    // Remover welcome card se presente
+    const welcomeCard = chatStream.querySelector('.welcome-card');
+    if (welcomeCard) welcomeCard.remove();
+
+    appendUserMessage(labelMsg, false);
+
+    // Inicializa AbortController para permitir cancelamento manual
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
     setGeneratingState(true);
@@ -824,11 +1380,11 @@ document.addEventListener('DOMContentLoaded', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: signal,
-        body: JSON.stringify(
-          imagensAEnviar.length
-            ? { message: finalMessage, images: imagensAEnviar }
-            : { message: finalMessage }
-        )
+        body: JSON.stringify({
+          message: finalMessage,
+          images: imagensAEnviar && imagensAEnviar.length ? imagensAEnviar : undefined,
+          session_id: currentSessionId || undefined
+        })
       });
 
       if (!response.ok) {
@@ -854,6 +1410,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const jsonStr = cleanBlock.substring(6);
         try {
           const eventData = JSON.parse(jsonStr);
+          if (eventData.type === 'session_id' && eventData.content) {
+            currentSessionId = eventData.content;
+            localStorage.setItem('apex_active_session_id', currentSessionId);
+          }
           handleSseEvent(eventData, textContentElem, getOrCreateThinkBlock, finishStatusPill);
           if (eventData.type === 'done' || eventData.type === 'error') {
             terminado = true;
@@ -895,6 +1455,14 @@ document.addEventListener('DOMContentLoaded', () => {
       finishStatusPill();
       setGeneratingState(false);
       loadStatus();
+      loadSessions();
+
+      // Processar próxima mensagem na fila, se houver
+      if (messageQueue.length > 0) {
+        const next = messageQueue.shift();
+        updateQueueBanner();
+        setTimeout(() => dispatchMessage(next), 120);
+      }
     }
   }
 

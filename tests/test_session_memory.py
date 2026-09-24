@@ -126,3 +126,65 @@ def test_format_live_usage_renders_dashboard_metrics():
     assert "Decode" in rendered
     assert "55.3" in rendered
     assert "22.7" in rendered
+
+
+def test_session_memory_disk_persistence_and_deletion():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_sessions.db"
+        mem = SessionMemory(str(db_path))
+
+        sess_id = "sess_disk_001"
+        mem.open_session(sess_id, model="test-qwen")
+
+        # Log user message (should trigger auto-summary and disk JSON file creation)
+        mem.log_event(sess_id, "user_message", "Como otimizar a latência KV cache no AMD Ryzen AI 9?")
+        mem.log_event(sess_id, "assistant_message", "Para otimizar o KV cache, mantenha o prefixo de ferramentas estável.")
+
+        # Check JSON file exists on disk
+        json_file = mem.sessions_dir / f"{sess_id}.json"
+        assert json_file.exists()
+
+        # Check content in JSON file
+        with open(json_file, "r", encoding="utf-8") as f:
+            disk_data = json.load(f)
+        assert disk_data["id"] == sess_id
+        assert len(disk_data["messages"]) == 2
+        assert "Como otimizar" in disk_data["summary"]
+
+        # Check get_session returns messages and summary
+        sess = mem.get_session(sess_id)
+        assert sess is not None
+        assert sess["id"] == sess_id
+        assert len(sess["messages"]) == 2
+        assert sess["messages"][0]["role"] == "user"
+        assert sess["messages"][1]["role"] == "assistant"
+
+        # Check delete_session removes SQLite records and disk file
+        deleted = mem.delete_session(sess_id)
+        assert deleted is True
+        assert not json_file.exists()
+        assert mem.get_session(sess_id) is None
+
+
+def test_mcp_turbo_toggle(monkeypatch, tmp_path):
+    monkeypatch.delenv("APEX_MCP_SERVERS", raising=False)
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "notebooks": {"command": "echo", "args": ["nb"]},
+            "memory": {"command": "echo", "args": ["mem"]},
+        }
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("APEX_MCP_CONFIG", str(cfg))
+    mgr = MCPManager()
+    assert len(mgr.servers) == 2
+
+    # Switch to Turbo (unload all)
+    mgr.set_enabled_servers([])
+    assert mgr.servers == {}
+    assert os.environ.get("APEX_MCP_SERVERS") == "none"
+
+    # Select specific server
+    mgr.set_enabled_servers(["notebooks"])
+    assert list(mgr.servers.keys()) == ["notebooks"]

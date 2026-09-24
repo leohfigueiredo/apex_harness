@@ -18,16 +18,16 @@
           <span class="logo-icon">⚡</span>
           <span class="logo-text">Apex Harness</span>
         </div>
-        <button id="btn-new-chat" class="btn-icon" title="Nova Conversa (/clear)">
+        <button id="btn-new-chat" class="btn-icon" data-i18n-title="new_chat" title="Nova Conversa (/clear)">
           <span>+</span>
         </button>
       </div>
 
       <!-- ── Monitor Ao Vivo ─────────────────────────────────────────── -->
       <div class="sidebar-section monitor-section">
-        <div class="monitor-header" id="monitor-toggle" title="Clique para expandir/recolher">
+        <div class="monitor-header" id="monitor-toggle" data-i18n-title="monitor_toggle" title="Clique para expandir/recolher">
           <span class="monitor-pulse" id="monitor-pulse"></span>
-          <h3 style="margin:0; flex:1">Monitor</h3>
+          <h3 style="margin:0; flex:1" data-i18n="monitor">Monitor</h3>
           <span class="monitor-chevron" id="monitor-chevron">▲</span>
         </div>
 
@@ -40,7 +40,7 @@
           </div>
 
           <!-- Contexto -->
-          <div class="mon-metric-label">Contexto</div>
+          <div class="mon-metric-label" data-i18n="context">Contexto</div>
           <div class="mon-bar-wrap">
             <div class="mon-bar-track">
               <div class="mon-bar-fill ctx-fill" id="mon-ctx-bar" style="width:0%"></div>
@@ -52,17 +52,17 @@
           <!-- Velocidade -->
           <div class="mon-grid-2">
             <div class="mon-metric">
-              <div class="mon-metric-label">Decode</div>
+              <div class="mon-metric-label" data-i18n="decode">Decode</div>
               <div class="mon-metric-val" id="mon-decode">— t/s</div>
             </div>
             <div class="mon-metric">
-              <div class="mon-metric-label">Cache KV</div>
+              <div class="mon-metric-label" data-i18n="kv_cache">Cache KV</div>
               <div class="mon-metric-val" id="mon-cache">—</div>
             </div>
           </div>
 
           <!-- RAM -->
-          <div class="mon-metric-label">RAM Sistema</div>
+          <div class="mon-metric-label" data-i18n="system_ram">RAM Sistema</div>
           <div class="mon-bar-wrap">
             <div class="mon-bar-track">
               <div class="mon-bar-fill ram-fill" id="mon-ram-bar" style="width:0%"></div>
@@ -73,15 +73,15 @@
           <!-- Sessão -->
           <div class="mon-session-grid">
             <div class="mon-sess-item">
-              <span class="mon-sess-label">📖 Lido</span>
+              <span class="mon-sess-label" data-i18n="read">📖 Lido</span>
               <span class="mon-sess-val" id="mon-sess-read">0</span>
             </div>
             <div class="mon-sess-item">
-              <span class="mon-sess-label">✍ Escrito</span>
+              <span class="mon-sess-label" data-i18n="written">✍ Escrito</span>
               <span class="mon-sess-val" id="mon-sess-written">0</span>
             </div>
             <div class="mon-sess-item mon-sess-total">
-              <span class="mon-sess-label">∑ Total</span>
+              <span class="mon-sess-label" data-i18n="total">∑ Total</span>
               <span class="mon-sess-val" id="mon-sess-total">0</span>
             </div>
           </div>
@@ -90,9 +90,9 @@
       <!-- ── fim Monitor ─────────────────────────────────────────────── -->
 
       <div class="sidebar-section">
-        <h3>Histórico de Sessões</h3>
+        <h3 data-i18n="session_history">Histórico de Sessões</h3>
         <div id="sessions-list" class="sessions-list">
-          <div class="empty-sessions">Buscando sessões...</div>
+          <div class="empty-sessions" data-i18n="fetching_sessions">Buscando sessões...</div>
         </div>
       </div>
 
@@ -111,12 +111,12 @@
           <div class="project-selector-wrapper">
             <span class="project-icon">📁</span>
             <span id="project-path" class="project-path" title="Clique para alterar a pasta de trabalho">Carregando pasta...</span>
-            <button id="btn-change-folder" class="btn-sm" title="Alterar pasta de trabalho">Alterar</button>
+            <button id="btn-change-folder" class="btn-sm" data-i18n="change" title="Alterar pasta de trabalho">Alterar</button>
           </div>
           <div class="model-selector-wrapper">
-            <label for="model-select">🤖 Modelo:</label>
+            <label for="model-select" data-i18n="model">🤖 Modelo:</label>
             <select id="model-select" class="select-dropdown">
-              <option value="">Carregando modelos...</option>
+              <option value="" data-i18n="loading_models">Carregando modelos...</option>
             </select>
           </div>
         </div>
@@ -127,19 +127,33 @@
             <span id="model-load-text">Modelo: Verificando...</span>
           </div>
           <div class="status-badge" id="context-status-badge" title="Uso do Context Window">
-            <span>📊 Contexto:</span>
+            <span data-i18n="context_badge">📊 Contexto:</span>
             <span id="context-load-text" class="text-accent">0%</span>
           </div>
           <div class="effort-selector-wrapper">
-            <label for="effort-select">🧠 Raciocínio:</label>
+            <label for="effort-select" data-i18n="reasoning">🧠 Raciocínio:</label>
             <select id="effort-select" class="select-dropdown">
-              <option value="medium">Médio ⚖️</option>
-              <option value="low">Baixo ⚡</option>
-              <option value="high">Alto 🧠</option>
-              <option value="off">Desligado 🚀</option>
+              <option value="medium" data-i18n="effort_medium">Médio ⚖️</option>
+              <option value="low" data-i18n="effort_low">Baixo ⚡</option>
+              <option value="high" data-i18n="effort_high">Alto 🧠</option>
+              <option value="off" data-i18n="effort_off">Desligado 🚀</option>
             </select>
           </div>
-          <button id="btn-clear" class="btn btn-secondary">Limpar Contexto</button>
+          <div class="mcp-selector-wrapper">
+            <label for="mcp-select" data-i18n="tools">🔌 Ferramentas:</label>
+            <select id="mcp-select" class="select-dropdown" title="Escolha Modo Turbo (rápido) ou carregamento de MCPs">
+              <option value="turbo" data-i18n="turbo_opt">⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)</option>
+              <option value="all" data-i18n="all_opt">🔌 Todos MCPs (Carregados)</option>
+            </select>
+            <button id="btn-open-mcp-modal" class="btn-sm" data-i18n="configure_btn" title="Gerenciar servidores MCP individualmente">⚙️ Configurar</button>
+          </div>
+          <button id="btn-clear" class="btn btn-secondary" data-i18n="clear_context">Limpar Contexto</button>
+          <div class="lang-selector-wrapper">
+            <button id="btn-lang-toggle" class="btn-lang" title="Mudar Idioma / Switch Language">
+              <span id="lang-flag">🇧🇷</span>
+              <span id="lang-text">PT</span>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -176,11 +190,21 @@
                  accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.html,.css,.json,.jsonl,.yaml,.yml,.toml,.csv,.tsv,.sql,.sh,.bash,.zsh,.rs,.go,.java,.c,.cpp,.h,.hpp,.rb,.php,.r,.tex,.rst,.xml,.log,.env,.ini,.cfg,.conf,.pdf"
                  multiple hidden>
 
-          <textarea id="user-input" placeholder="Digite sua mensagem ou comando (pressione Enter para enviar, Shift+Enter para nova linha)..." rows="1"></textarea>
+          <textarea id="user-input" data-i18n-placeholder="input_placeholder" placeholder="Digite sua mensagem ou comando (pressione Enter para enviar, Shift+Enter para nova linha)..." rows="1"></textarea>
+          <button id="btn-stop" class="btn btn-stop" data-i18n-title="stop" title="Interromper geração" style="display:none;">
+            <span>⏹️</span>
+            <span data-i18n="stop">Parar</span>
+          </button>
           <button id="btn-send" class="btn btn-primary">
-            <span>Enviar</span>
+            <span data-i18n="send">Enviar</span>
             <span class="send-icon">➔</span>
           </button>
+        </div>
+
+        <!-- Fila de mensagens em espera -->
+        <div class="queue-banner" id="queue-banner" style="display:none;">
+          <span class="queue-icon">⏳</span>
+          <span id="queue-text">1 mensagem na fila (será enviada a seguir)</span>
         </div>
 
         <!-- Miniaturas das imagens prontas a enviar -->
@@ -190,18 +214,9 @@
         <!-- vision-warning sempre oculto (botão desativado já comunica) -->
         <div class="vision-warning" id="vision-warning" hidden></div>
 
-        <!--
-          Barra de contagem de tokens. "Leitura" = o que o MODELO le: o contexto
-          da conversa mais a mensagem que estás a escrever agora (esta contada
-          pelo tokenizer real do modelo, via /api/tokenize). "Escrita" = o que o
-          modelo escreveu, na última resposta e somado na sessão.
-
-          O numero deixou de ser `caracteres // 4`: vem do `usage` que o
-          llama-server envia no fim de cada pedido (core.py:_capture_usage).
-        -->
         <div class="token-bar" id="token-bar">
           <span class="tok-group" title="O que o modelo lê: contexto da conversa + a mensagem que estás a escrever">
-            <span class="tok-ico">📖</span><span class="tok-label">Leitura</span>
+            <span class="tok-ico">📖</span><span class="tok-label" data-i18n="reading">Leitura</span>
             <span class="tok-num" id="tok-read-ctx" title="Tokens do contexto (o último prompt enviado ao modelo)">0</span>
             <span class="tok-plus">+</span>
             <span class="tok-num" id="tok-read-msg" title="Tokens da mensagem que estás a escrever agora">0</span>
@@ -209,12 +224,12 @@
           </span>
 
           <span class="tok-group" title="O que o modelo escreveu">
-            <span class="tok-ico">✍️</span><span class="tok-label">Escrita</span>
+            <span class="tok-ico">✍️</span><span class="tok-label" data-i18n="writing">Escrita</span>
             <span class="tok-num" id="tok-write-last" title="Tokens gerados na última resposta">0</span>
-            <span class="tok-unit">última</span>
+            <span class="tok-unit" data-i18n="last">última</span>
             <span class="tok-plus">·</span>
             <span class="tok-num" id="tok-write-session" title="Tokens gerados nesta sessão">0</span>
-            <span class="tok-unit">sessão</span>
+            <span class="tok-unit" data-i18n="session">sessão</span>
           </span>
 
           <span class="tok-group tok-right">
@@ -227,10 +242,36 @@
         </div>
 
         <div class="input-hints">
-          <span>Use <strong>/btw &lt;nota&gt;</strong> para interromper/guiar raciocínio • Troque o modelo no menu superior sem perder o histórico</span>
+          <span data-i18n="hints">Use <strong>/btw &lt;nota&gt;</strong> para interromper/guiar raciocínio • Troque o modelo no menu superior sem perder o histórico</span>
         </div>
       </footer>
     </main>
+  </div>
+
+  <!-- Modal de Configuração de MCPs -->
+  <div id="mcp-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 data-i18n="mcp_modal_title">🔌 Gerenciador de Ferramentas MCP</h3>
+        <button id="btn-close-mcp-modal" class="btn-icon" title="Fechar">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc" data-i18n="mcp_modal_desc">
+          Selecione quais servidores MCP deseja ativar. No <strong>Modo Turbo</strong>, todos os MCPs são desativados para reduzir o tamanho do prompt e acelerar a inferência.
+        </p>
+        <div class="mcp-quick-actions">
+          <button id="btn-mcp-turbo" type="button" class="btn btn-sm btn-outline" data-i18n="mcp_btn_turbo">⚡ Modo Turbo (Desligar Todos)</button>
+          <button id="btn-mcp-all" type="button" class="btn btn-sm btn-outline" data-i18n="mcp_btn_all">🔌 Selecionar Todos</button>
+        </div>
+        <div id="mcp-servers-checklist" class="mcp-checklist">
+          <!-- Servidores injetados via app.js -->
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span id="mcp-modal-status" class="modal-status-text"></span>
+        <button id="btn-save-mcp" type="button" class="btn btn-primary" data-i18n="mcp_btn_save">Salvar e Aplicar</button>
+      </div>
+    </div>
   </div>
 
   <script src="/web/app.js"></script>

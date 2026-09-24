@@ -1,3 +1,4 @@
+import os
 import json
 import urllib.request
 import threading
@@ -126,4 +127,85 @@ def test_consecutive_chat_requests():
 
         assert call_count["count"] == 2
     finally:
+        server.shutdown()
+
+
+def test_web_server_session_and_mcp_endpoints():
+    agent = ApexAgent(model_name="test-model", enable_mcp=False)
+    server = create_web_server(agent=agent, port=7896)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        # 1. POST /api/session/new
+        req_new = urllib.request.Request(
+            "http://127.0.0.1:7896/api/session/new",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_new) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            sess_id = data["session_id"]
+            assert sess_id.startswith("apex-")
+
+        # 2. GET /api/sessions
+        req_sess = urllib.request.Request("http://127.0.0.1:7896/api/sessions")
+        with urllib.request.urlopen(req_sess) as resp:
+            data = json.loads(resp.read().decode())
+            assert "sessions" in data
+            assert any(s["id"] == sess_id for s in data["sessions"])
+
+        # 3. GET /api/session?id=...
+        req_get = urllib.request.Request(f"http://127.0.0.1:7896/api/session?id={sess_id}")
+        with urllib.request.urlopen(req_get) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            assert data["session"]["id"] == sess_id
+
+        # 4. POST /api/session/select
+        req_sel = urllib.request.Request(
+            "http://127.0.0.1:7896/api/session/select",
+            data=json.dumps({"id": sess_id}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_sel) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            assert data["session"]["id"] == sess_id
+
+        # 5. GET /api/mcp
+        req_mcp = urllib.request.Request("http://127.0.0.1:7896/api/mcp")
+        with urllib.request.urlopen(req_mcp) as resp:
+            data = json.loads(resp.read().decode())
+            assert "mode" in data
+            assert "available_servers" in data
+
+        # 6. POST /api/mcp (turbo mode)
+        req_mcp_turbo = urllib.request.Request(
+            "http://127.0.0.1:7896/api/mcp",
+            data=json.dumps({"mode": "turbo"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_mcp_turbo) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            assert data["mode"] == "turbo"
+            assert data["mcp_tools_count"] == 0
+
+        # 7. DELETE /api/session
+        req_del = urllib.request.Request(
+            f"http://127.0.0.1:7896/api/session?id={sess_id}",
+            method="DELETE"
+        )
+        with urllib.request.urlopen(req_del) as resp:
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            assert data["deleted"] == sess_id
+
+    finally:
+        os.environ.pop("APEX_MCP_SERVERS", None)
         server.shutdown()

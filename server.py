@@ -152,13 +152,22 @@ class ApexWebHandler(BaseHTTPRequestHandler):
 
     def _set_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def do_OPTIONS(self):
         self.send_response(200)
         self._set_cors_headers()
         self.end_headers()
+
+    def do_DELETE(self):
+        url_path = urllib.parse.urlparse(self.path).path
+        if url_path in ("/api/session", "/api/sessions"):
+            query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sess_id = query_params.get("id", [""])[0].strip()
+            self._handle_delete_session({"id": sess_id})
+        else:
+            self.send_error(404, "Endpoint Not Found")
 
     def do_GET(self):
         url_path = urllib.parse.urlparse(self.path).path
@@ -182,8 +191,12 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_get_models()
         elif url_path == "/api/history":
             self._handle_get_history()
+        elif url_path == "/api/session":
+            self._handle_get_session()
         elif url_path == "/api/sessions":
             self._handle_get_sessions()
+        elif url_path == "/api/mcp":
+            self._handle_get_mcp()
         elif url_path == "/api/project":
             self._handle_get_project()
         elif url_path == "/api/status":
@@ -213,6 +226,14 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_post_tokenize(data)
         elif url_path == "/api/model":
             self._handle_post_model(data)
+        elif url_path == "/api/session/select":
+            self._handle_post_session_select(data)
+        elif url_path == "/api/session/new":
+            self._handle_post_session_new()
+        elif url_path in ("/api/session/delete", "/api/sessions/delete"):
+            self._handle_delete_session(data)
+        elif url_path == "/api/mcp":
+            self._handle_post_mcp(data)
         elif url_path == "/api/btw":
             self._handle_post_btw(data)
         elif url_path == "/api/clear":
@@ -537,10 +558,170 @@ class ApexWebHandler(BaseHTTPRequestHandler):
     def _handle_get_sessions(self):
         try:
             mem = get_session_memory()
-            sessions = mem.get_active_sessions(limit=10)
-            self._send_json({"sessions": sessions})
+            sessions = mem.list_sessions(limit=50)
+            current_id = os.environ.get("APEX_SESSION_ID") or (sessions[0]["id"] if sessions else "")
+            self._send_json({
+                "sessions": sessions,
+                "current_session_id": current_id
+            })
         except Exception as e:
             self._send_json({"sessions": [], "error": str(e)})
+
+    def _handle_get_session(self):
+        query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        sess_id = query_params.get("id", [""])[0].strip()
+        if not sess_id:
+            self._send_json({"error": "Parametro id obrigatorio"}, status=400)
+            return
+        mem = get_session_memory()
+        sess = mem.get_session(sess_id)
+        if not sess:
+            self._send_json({"error": f"Sessao '{sess_id}' nao encontrada"}, status=404)
+            return
+        self._send_json({"status": "ok", "session": sess})
+
+    def _handle_post_session_select(self, data: Dict[str, Any]):
+        sess_id = (data.get("id") or "").strip()
+        if not sess_id:
+            self._send_json({"error": "id obrigatorio"}, status=400)
+            return
+        mem = get_session_memory()
+        sess = mem.get_session(sess_id)
+        if not sess:
+            self._send_json({"error": f"Sessao '{sess_id}' nao encontrada"}, status=404)
+            return
+        os.environ["APEX_SESSION_ID"] = sess_id
+        agent = _GLOBAL_AGENT or ApexAgent()
+        messages = sess.get("messages", [])
+        if hasattr(agent, "load_history"):
+            agent.load_history(messages)
+        self._send_json({"status": "ok", "session": sess})
+
+    def _handle_post_session_new(self):
+        agent = _GLOBAL_AGENT or ApexAgent()
+        mem = get_session_memory()
+        os.environ.pop("APEX_SESSION_ID", None)
+        new_id = mem.ensure_session_id(model=agent.model_name)
+        agent.reset()
+        self._send_json({"status": "ok", "session_id": new_id})
+
+    def _handle_delete_session(self, data: Optional[Dict[str, Any]] = None):
+        data = data or {}
+        sess_id = (data.get("id") or "").strip()
+        if not sess_id:
+            query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sess_id = query_params.get("id", [""])[0].strip()
+        if not sess_id:
+            self._send_json({"error": "id obrigatorio"}, status=400)
+            return
+        mem = get_session_memory()
+        mem.delete_session(sess_id)
+        current = os.environ.get("APEX_SESSION_ID")
+        active_id = current
+        if current == sess_id or not current:
+            agent = _GLOBAL_AGENT or ApexAgent()
+            os.environ.pop("APEX_SESSION_ID", None)
+            active_id = mem.ensure_session_id(model=agent.model_name)
+            agent.reset()
+        self._send_json({
+            "status": "ok",
+            "deleted": sess_id,
+            "active_session_id": active_id
+        })
+
+    def _handle_get_mcp(self):
+        try:
+            from apex_harness.mcp_client import get_mcp_manager
+            agent = _GLOBAL_AGENT or ApexAgent()
+            mgr = get_mcp_manager()
+
+            all_servers = []
+            if mgr.config_path and mgr.config_path.exists():
+                try:
+                    with open(mgr.config_path, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                        all_servers = list(cdata.get("mcpServers", {}).keys())
+                except Exception:
+                    pass
+            if not all_servers:
+                all_servers = list(mgr.servers.keys())
+
+            mcp_tool_names = [t["function"]["name"] for t in agent.tools if t["function"]["name"].startswith("mcp_")]
+            is_turbo = len(mcp_tool_names) == 0
+            enabled = mgr.enabled_servers
+
+            if is_turbo:
+                mode = "turbo"
+            elif set(all_servers) and set(enabled) >= set(all_servers):
+                mode = "all"
+            else:
+                mode = "custom"
+
+            self._send_json({
+                "mode": mode,
+                "available_servers": all_servers,
+                "enabled_servers": enabled,
+                "total_tools": len(agent.tools),
+                "mcp_tools_count": len(mcp_tool_names),
+                "mcp_tools": mcp_tool_names
+            })
+        except Exception as e:
+            self._send_json({"error": str(e), "mode": "unknown", "available_servers": []}, status=500)
+
+    def _handle_post_mcp(self, data: Dict[str, Any]):
+        try:
+            from apex_harness.mcp_client import get_mcp_manager
+            agent = _GLOBAL_AGENT or ApexAgent()
+            mgr = get_mcp_manager()
+
+            mode = (data.get("mode") or "").lower().strip()
+            servers = data.get("servers") or []
+
+            all_servers = []
+            if mgr.config_path and mgr.config_path.exists():
+                try:
+                    with open(mgr.config_path, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                        all_servers = list(cdata.get("mcpServers", {}).keys())
+                except Exception:
+                    pass
+            if not all_servers:
+                all_servers = list(mgr.servers.keys())
+
+            if mode in ("turbo", "unload", "off", "disable"):
+                agent.tools = [t for t in agent.tools if not t["function"]["name"].startswith("mcp_")]
+                mgr.set_enabled_servers([])
+                msg = f"⚡ Modo Turbo ativado (Sem MCPs, ~4.2 t/s). {len(agent.tools)} ferramentas base ativas."
+                final_mode = "turbo"
+            elif mode in ("all", "load", "on", "enable"):
+                mgr.set_enabled_servers(all_servers)
+                agent.tools = [t for t in agent.tools if not t["function"]["name"].startswith("mcp_")]
+                agent._init_mcp()
+                msg = f"🔌 Todos os MCPs carregados ({len(agent.tools)} ferramentas ativas)."
+                final_mode = "all"
+            elif mode == "custom" or servers:
+                chosen = [s.strip() for s in servers if s.strip()]
+                mgr.set_enabled_servers(chosen)
+                agent.tools = [t for t in agent.tools if not t["function"]["name"].startswith("mcp_")]
+                agent._init_mcp()
+                msg = f"🔌 MCPs configurados: {', '.join(chosen)} ({len(agent.tools)} ferramentas ativas)."
+                final_mode = "custom"
+            else:
+                self._send_json({"error": "Modo inválido. Escolha 'turbo', 'all' ou 'custom'."}, status=400)
+                return
+
+            mcp_tool_names = [t["function"]["name"] for t in agent.tools if t["function"]["name"].startswith("mcp_")]
+            self._send_json({
+                "status": "ok",
+                "message": msg,
+                "mode": final_mode,
+                "available_servers": all_servers,
+                "enabled_servers": mgr.enabled_servers,
+                "total_tools": len(agent.tools),
+                "mcp_tools_count": len(mcp_tool_names)
+            })
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
 
     def _handle_post_model(self, data: Dict[str, Any]):
         """Troca de modelo — agora VERIFICADA.
@@ -860,9 +1041,14 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             # e regista os dois lados da conversa.                                #
             # ------------------------------------------------------------------ #
             mem = get_session_memory()
-            sid = os.environ.get("APEX_SESSION_ID") or mem.ensure_session_id(
-                model=agent.model_name
-            )
+            client_sid = (data.get("session_id") or "").strip()
+            if client_sid:
+                sid = mem.ensure_session_id(session_id=client_sid, model=agent.model_name)
+            else:
+                sid = os.environ.get("APEX_SESSION_ID") or mem.ensure_session_id(
+                    model=agent.model_name
+                )
+            send_sse_event("session_id", sid)
             if user_message:
                 mem.log_event(sid, "user_message", user_message)
 

@@ -52,6 +52,8 @@ class MCPManager:
         selected = os.environ.get("APEX_MCP_SERVERS", "").strip()
         if not selected:
             return list(all_servers.keys())
+        if selected.lower() in ("none", "off", "disable", "disabled", "turbo", "empty"):
+            return []
 
         names = []
         for part in selected.replace(";", ",").split(","):
@@ -79,7 +81,10 @@ class MCPManager:
                     if item and item in all_servers:
                         names.append(item)
             normalized = list(dict.fromkeys(names))
-            os.environ["APEX_MCP_SERVERS"] = ",".join(normalized) if normalized else ""
+            if server_names is not None and len(server_names) == 0:
+                os.environ["APEX_MCP_SERVERS"] = "none"
+            else:
+                os.environ["APEX_MCP_SERVERS"] = ",".join(normalized) if normalized else ""
             self.load_config()
             return self.enabled_servers
         except Exception:

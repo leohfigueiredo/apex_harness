@@ -26,6 +26,8 @@ class SessionMemory:
             self.db_path = p / "sessions.db"
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir = self.db_path.parent / "sessions"
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -84,13 +86,131 @@ class SessionMemory:
         """Log an event (decision, file_touched, todo_open, todo_done, note) for the session."""
         self.open_session(session_id)
         now = datetime.now(timezone.utc).isoformat()
+        clean_content = content.strip()
+
         with self._get_connection() as conn:
+            # Auto-generate summary for session if it doesn't have one and this is the first user message
+            if event_type == "user_message":
+                cur_sum = conn.execute("SELECT summary FROM sessions WHERE id = ?;", (session_id,)).fetchone()
+                if cur_sum and (not cur_sum["summary"] or cur_sum["summary"].startswith("Sessão ")):
+                    first_line = clean_content.split("\n")[0].strip()
+                    auto_title = (first_line[:50] + "…") if len(first_line) > 50 else first_line
+                    if auto_title:
+                        conn.execute("UPDATE sessions SET summary = ? WHERE id = ?;", (auto_title, session_id))
+
             cur = conn.execute("""
                 INSERT INTO events (session_id, ts, event_type, content)
                 VALUES (?, ?, ?, ?);
-            """, (session_id, now, event_type, content.strip()))
+            """, (session_id, now, event_type, clean_content))
             conn.commit()
-            return cur.lastrowid
+            last_id = cur.lastrowid
+
+        # Persist session to JSON file on disk
+        try:
+            self.export_session_file(session_id)
+        except Exception:
+            pass
+
+        return last_id
+
+    def export_session_file(self, session_id: str) -> Optional[Path]:
+        """Export session metadata, messages, and events to a standalone JSON file on disk."""
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT * FROM sessions WHERE id = ?;", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            sess_dict = dict(row)
+
+        events = self.get_events(session_id)
+        messages = []
+        for ev in events:
+            if ev["event_type"] in ("user_message", "assistant_message"):
+                role = "user" if ev["event_type"] == "user_message" else "assistant"
+                messages.append({
+                    "role": role,
+                    "content": ev["content"],
+                    "ts": ev["ts"]
+                })
+
+        data = {
+            "id": sess_dict["id"],
+            "started_at": sess_dict["started_at"],
+            "last_active": sess_dict["last_active"],
+            "model": sess_dict["model"],
+            "summary": sess_dict["summary"],
+            "messages": messages,
+            "events": events
+        }
+
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        target = self.sessions_dir / f"{session_id}.json"
+        tmp_target = self.sessions_dir / f"{session_id}.json.tmp"
+        with open(tmp_target, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp_target.replace(target)
+        return target
+
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve full session data including messages, either from SQLite or disk."""
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT * FROM sessions WHERE id = ?;", (session_id,))
+            row = cur.fetchone()
+            if row:
+                sess = dict(row)
+                events = self.get_events(session_id)
+                messages = []
+                for ev in events:
+                    if ev["event_type"] in ("user_message", "assistant_message"):
+                        role = "user" if ev["event_type"] == "user_message" else "assistant"
+                        messages.append({
+                            "role": role,
+                            "content": ev["content"],
+                            "ts": ev["ts"]
+                        })
+                sess["messages"] = messages
+                sess["events"] = events
+                return sess
+
+        # Fallback to disk JSON file
+        target = self.sessions_dir / f"{session_id}.json"
+        if target.exists():
+            try:
+                with open(target, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # Re-index into sqlite
+                self.open_session(data["id"], model=data.get("model", ""))
+                if data.get("summary"):
+                    self.update_summary(data["id"], data["summary"])
+                for ev in data.get("events", []):
+                    with self._get_connection() as conn:
+                        conn.execute("""
+                            INSERT INTO events (session_id, ts, event_type, content)
+                            VALUES (?, ?, ?, ?);
+                        """, (data["id"], ev.get("ts", datetime.now(timezone.utc).isoformat()), ev.get("event_type", "note"), ev.get("content", "")))
+                        conn.commit()
+                return data
+            except Exception:
+                pass
+        return None
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete session from SQLite and remove its JSON file from disk."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM events WHERE session_id = ?;", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?;", (session_id,))
+            conn.commit()
+
+        target = self.sessions_dir / f"{session_id}.json"
+        if target.exists():
+            try:
+                target.unlink()
+            except Exception:
+                pass
+
+        if os.environ.get("APEX_SESSION_ID") == session_id:
+            os.environ.pop("APEX_SESSION_ID", None)
+        return True
 
     def log_decision(self, session_id: str, text: str) -> int:
         """Record an architectural or design decision."""
@@ -129,6 +249,10 @@ class SessionMemory:
         with self._get_connection() as conn:
             conn.execute("UPDATE sessions SET summary = ? WHERE id = ?;", (summary, session_id))
             conn.commit()
+        try:
+            self.export_session_file(session_id)
+        except Exception:
+            pass
 
     def get_events(self, session_id: str) -> List[Dict[str, Any]]:
         """Retrieve all events for a given session."""
@@ -139,12 +263,32 @@ class SessionMemory:
             """, (session_id,))
             return [dict(r) for r in cur.fetchall()]
 
-    def list_sessions(self, limit: int = 15) -> List[Dict[str, Any]]:
-        """List past sessions ordered by most recently active."""
+    def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List past sessions ordered by most recently active, syncing from disk."""
+        # Sync any standalone JSON session files in sessions_dir
+        if self.sessions_dir.exists():
+            try:
+                for json_file in self.sessions_dir.glob("*.json"):
+                    sid = json_file.stem
+                    with self._get_connection() as conn:
+                        cur = conn.execute("SELECT 1 FROM sessions WHERE id = ?;", (sid,))
+                        if not cur.fetchone():
+                            try:
+                                with open(json_file, "r", encoding="utf-8") as f:
+                                    sdata = json.load(f)
+                                self.open_session(sdata["id"], model=sdata.get("model", ""))
+                                if sdata.get("summary"):
+                                    self.update_summary(sdata["id"], sdata["summary"])
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
         with self._get_connection() as conn:
             cur = conn.execute("""
                 SELECT s.id, s.started_at, s.last_active, s.model, s.summary,
-                       COUNT(e.id) as event_count
+                       COUNT(e.id) as event_count,
+                       SUM(CASE WHEN e.event_type IN ('user_message', 'assistant_message') THEN 1 ELSE 0 END) as message_count
                 FROM sessions s
                 LEFT JOIN events e ON s.id = e.session_id
                 GROUP BY s.id
@@ -153,7 +297,7 @@ class SessionMemory:
             """, (limit,))
             return [dict(r) for r in cur.fetchall()]
 
-    def get_active_sessions(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_active_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Compatibility wrapper for the web UI and CLI status screens."""
         return self.list_sessions(limit=limit)
 

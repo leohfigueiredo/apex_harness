@@ -612,6 +612,109 @@ TOOLS_REGISTRY = {
     "record_wiki_skill": record_wiki_skill,
 }
 
+# ---------------------------------------------------------------------------
+# Tiered Tool Disclosure (Jev Engineering pattern)
+# ---------------------------------------------------------------------------
+#
+# O problema: expor todos os schemas completos em cada turno custa 5-12% do
+# token budget em overhead fixo -- tokens gastos em ferramentas que o modelo
+# nunca vai usar nessa mensagem.
+#
+# Solução em 3 tiers (Jev Engineering for Coding Agents, 2026):
+#
+#   TIER 1 · SNIPPETS  → 1 linha por ferramenta, ~200 tokens total
+#                         Sempre visível. Serve como "menu" para o modelo.
+#
+#   TIER 2 · ON-DEMAND → schemas completos das ferramentas seleccionadas
+#                         Injectado pelo harness baseado na intenção do turno.
+#
+#   TIER 3 · DOCS      → descrição longa / exemplos (reservado para futuro)
+#
+# O `TOOLS_DEFINITION` original continua a existir como fonte de verdade
+# para os schemas completos (Tier 2). O `get_tool_schemas_for` extrai os
+# schemas apenas das ferramentas necessárias.
+# ---------------------------------------------------------------------------
+
+TOOLS_SNIPPETS = """Ferramentas disponíveis (chame com tool_call):
+web_search(query) · fetch_url(url) · list_dir(path) · read_file(path, [start_line], [end_line])
+write_file(path, content) · edit_file(path, old_text, new_text) · bash_exec(command)
+git_status([repo_path]) · git_diff([repo_path], [staged], [file_path]) · git_log([repo_path], [n])
+git_branch([repo_path], [create], [switch_to]) · git_commit(message, [repo_path], [add_all])
+rag_search(query, [mode], [top_k]) · rag_ingest(path) · recall_memory(query, [top_k])
+run_tdp_pipeline(task, [execute_code]) · session_log(event_type, content)
+consult_wiki(query, [category]) · record_wiki_skill(title, content, [category], [tags])"""
+
+
+def get_tool_schemas_for(tool_names: "List[str]", all_tools: "List[Dict[str, Any]]") -> "List[Dict[str, Any]]":
+    """Return full OpenAI-format schemas only for the requested tool names (Tier 2)."""
+    name_set = set(tool_names)
+    return [t for t in all_tools if t["function"]["name"] in name_set]
+
+
+# ---------------------------------------------------------------------------
+# Tool Output Compressor (Visibility Ladder)
+# ---------------------------------------------------------------------------
+#
+# Outputs longos de ferramentas consomem 10-20% do token budget em sessões
+# longas porque entram *completos* no histórico e são reenviados a cada turno.
+# (grep de 2400 linhas → aparece em todos os turnos seguintes)
+#
+# Regras:
+#   • bash_exec / grep / find: truncar a N linhas, guardar contagem
+#   • read_file: truncar a MAX_FILE_LINES linhas
+#   • outros: truncar a MAX_GENERIC_CHARS caracteres
+#
+# O texto truncado inclui um marcador "[X lines hidden — use read_file ou
+# bash_exec para ver mais]" para que o modelo saiba que pode pedir mais.
+# ---------------------------------------------------------------------------
+
+_OUTPUT_MAX_LINES = {
+    "bash_exec":   80,   # comandos: grep/find/ps muito barulhentos
+    "read_file":  120,   # ficheiros: já tem paginação nativa
+    "git_diff":   200,   # diffs podem ser longos mas são sempre úteis
+    "git_log":     40,
+    "list_dir":    60,
+    "web_search":  60,
+    "fetch_url":   80,
+}
+_OUTPUT_MAX_CHARS_DEFAULT = 6000  # fallback para ferramentas não listadas
+
+
+def compress_tool_output(tool_name: str, output: str) -> str:
+    """
+    Compress a tool output before it enters the conversation history.
+
+    Keeps the most informative lines, appending a truncation marker so the
+    model knows it can request the rest explicitly.
+    """
+    if not output:
+        return output
+
+    max_lines = _OUTPUT_MAX_LINES.get(tool_name)
+
+    if max_lines is not None:
+        lines = output.splitlines()
+        if len(lines) <= max_lines:
+            return output
+        kept = lines[:max_lines]
+        hidden = len(lines) - max_lines
+        kept.append(
+            f"\n… [{hidden} linha(s) omitida(s) para poupar contexto — "
+            f"use bash_exec ou read_file para ver mais]"
+        )
+        return "\n".join(kept)
+
+    # Fallback: character limit
+    if len(output) > _OUTPUT_MAX_CHARS_DEFAULT:
+        hidden_chars = len(output) - _OUTPUT_MAX_CHARS_DEFAULT
+        return (
+            output[:_OUTPUT_MAX_CHARS_DEFAULT]
+            + f"\n… [{hidden_chars} caractere(s) omitido(s)]"
+        )
+
+    return output
+
+
 TOOLS_DEFINITION = [
     {
         "type": "function",
