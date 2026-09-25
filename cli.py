@@ -197,7 +197,7 @@ def print_help():
     table.add_row("/clear, /new", "Limpa o histórico da sessão e inicia um novo tópico")
     table.add_row("/compact", "Compacta o contexto anterior para economizar tokens de memória")
     table.add_row("/doctor", "Verifica a saúde do sistema (Servidor, GPU, RAM, MCP, Ferramentas)")
-    table.add_row("/npu", "Exibe diagnóstico do NPU AMD XDNA2 (driver, firmware, Lemonade runtime)")
+    table.add_row("/npu [start|stop|models|status]", "Gerencia NPU AMD XDNA2 sob demanda (Lemonade + FLM)")
     table.add_row("/subagents", "Lista os subagentes especializados e alocação de hardware (NPU vs GPU)")
     table.add_row("/tdp <task>", "Pipeline Context! (TDP): Researcher + Planner (PTCF) + Executor/Healer")
     table.add_row("/rag [ingest|search|ask] <args>", "Hybrid RAG + Rerank local sobre documentos e código")
@@ -469,16 +469,7 @@ def main():
     console.print(f"[dim]Sessão persistente: [bold green]{active_session_id}[/bold green] | Endpoint: [bold green]{args.url}[/bold green] | Modelo: [bold yellow]{args.model}[/bold yellow] | Projeto: [bold cyan]{Path.cwd()}[/bold cyan][/dim]")
     console.print("[dim]Digite sua mensagem ou use [bold]/help[/bold] para comandos. Ctrl+C cancela, Ctrl+D sai.\n[/dim]")
 
-    # Warm start NPU manager in background if NPU is usable (parallel warm-up)
-    try:
-        from apex_harness.npu_detect import npu_available
-        from apex_harness.npu_backend import get_npu_manager
-        if npu_available().usable:
-            mgr = get_npu_manager()
-            if not mgr.is_running():
-                mgr.start(wait_ready=False)
-    except Exception:
-        pass
+    # NPU manager operates strictly on-demand (no background auto-start)
 
     show_thinking = args.show_thinking
     agent = ApexAgent(
@@ -642,10 +633,66 @@ def main():
                     run_doctor(agent)
                     continue
                 elif cmd in ["/npu", "/xdna"]:
+                    parts = user_input.strip().split()
+                    subcmd = parts[1].lower() if len(parts) > 1 else "status"
+
                     from apex_harness.npu_detect import npu_available
-                    st = npu_available()
-                    console.print(Panel(st.report, title="[bold cyan]AMD XDNA2 NPU Status[/bold cyan]", border_style="cyan"))
-                    continue
+                    from apex_harness.npu_backend import get_npu_manager
+
+                    mgr = get_npu_manager()
+
+                    if subcmd in ["models", "list"]:
+                        try:
+                            res = subprocess.run(["lemonade", "list", "--downloaded"], capture_output=True, text=True, timeout=5)
+                            console.print(Panel(res.stdout.strip() or "Nenhum modelo NPU listado.", title="🧠 Modelos NPU no Disco", border_style="cyan"))
+                        except Exception as e:
+                            console.print(f"[red]Erro ao listar modelos: {e}[/red]")
+                        continue
+
+                    elif subcmd in ["start", "load", "up"]:
+                        model_name = parts[2] if len(parts) > 2 else "qwen3-0.6b-FLM"
+                        with console.status(f"[cyan]Iniciando Lemonade NPU e carregando '{model_name}'...[/cyan]"):
+                            # Inicia o servidor se não estiver rodando
+                            if not mgr.is_running() and not mgr.check_health(timeout=0.5):
+                                mgr.start(wait_ready=True, ready_timeout=10.0)
+
+                            # Carrega o modelo via lemonade CLI
+                            try:
+                                res = subprocess.run(["lemonade", "load", model_name], capture_output=True, text=True, timeout=30)
+                                if res.returncode == 0:
+                                    console.print(f"[green]✓ Modelo '{model_name}' carregado com sucesso na NPU AMD XDNA2![/green]")
+                                    console.print("[dim]Endpoint ativo: http://127.0.0.1:8090/v1 (Critic e Subagentes agora acelerados por hardware)[/dim]")
+                                else:
+                                    err_msg = res.stderr or res.stdout
+                                    console.print(f"[yellow]Aviso ao carregar modelo: {err_msg.strip()}[/yellow]")
+                            except Exception as e:
+                                console.print(f"[red]Falha ao chamar lemonade load: {e}[/red]")
+                        continue
+
+                    elif subcmd in ["stop", "unload", "down", "kill"]:
+                        with console.status("[cyan]Descarregando modelo e encerrando Lemonade NPU...[/cyan]"):
+                            try:
+                                subprocess.run(["lemonade", "unload"], capture_output=True, text=True, timeout=10)
+                            except Exception:
+                                pass
+                            mgr.stop()
+                            console.print("[green]✓ NPU descarregada e servidor Lemonade parado. Memória RAM 100% liberada.[/green]")
+                        continue
+
+                    else:
+                        st = npu_available()
+                        srv_status = "[bold green]ATIVO (Porta 8090)[/bold green]" if mgr.check_health(timeout=0.5) else "[bold yellow]INATIVO (Sob Demanda)[/bold yellow]"
+                        help_text = (
+                            f"{st.report}\n\n"
+                            f"Servidor Lemonade NPU: {srv_status}\n\n"
+                            "[bold cyan]Comandos disponíveis:[/bold cyan]\n"
+                            "  • [bold]/npu start [modelo][/bold] - Sobe o Lemonade e carrega o modelo (padrão: qwen3-0.6b-FLM)\n"
+                            "  • [bold]/npu stop[/bold]           - Descarrega o modelo da NPU e para o servidor\n"
+                            "  • [bold]/npu models[/bold]         - Lista modelos compatíveis baixados no disco\n"
+                            "  • [bold]/npu status[/bold]         - Mostra este diagnóstico de hardware"
+                        )
+                        console.print(Panel(help_text, title="[bold cyan]⚡ AMD XDNA2 NPU & Lemonade Manager[/bold cyan]", border_style="cyan"))
+                        continue
                 elif cmd in ["/subagents", "/subagent"]:
                     from apex_harness.subagents import get_subagent_registry
                     reg = get_subagent_registry()

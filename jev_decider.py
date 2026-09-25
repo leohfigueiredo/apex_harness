@@ -63,13 +63,6 @@ _JEV_ENDPOINTS: List[Dict[str, str]] = [
         "model":  "qwen3.8_4b_distilled_gguf",
         "format": "openai",
     },
-    {
-        # Fallback Ollama
-        "name":   "Ollama-Qwen3-8B",
-        "api":    "http://127.0.0.1:11434",
-        "model":  "qwen3:8b",
-        "format": "ollama",
-    },
 ]
 
 _JEV_SYSTEM_PROMPT = (

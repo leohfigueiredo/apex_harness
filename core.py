@@ -2,6 +2,7 @@ import os
 import re
 import json
 import httpx
+import time
 import urllib.request
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from openai import OpenAI
@@ -748,6 +749,33 @@ class ApexAgent:
             except Exception:
                 pass
 
+    def _sanitize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Garante compatibilidade estrita com templates Jinja de modelos locais (Qwen/Swift/Llama).
+        
+        Regras:
+        1. Apenas a PRIMEIRA mensagem pode ter role: 'system'. Qualquer system subsequente
+           é convertido para role: 'user' com prefixo contextual.
+        2. Remove mensagens com conteúdo vazio ou nulo que possam quebrar a validação.
+        """
+        if not messages:
+            return []
+        sanitized = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                if not sanitized:
+                    sanitized.append(dict(m))
+                else:
+                    text = str(content or "")
+                    sanitized.append({
+                        "role": "user",
+                        "content": f"[INFORMAÇÃO DE CONTEXTO DO SISTEMA]:\n{text}"
+                    })
+            else:
+                sanitized.append(dict(m))
+        return sanitized
+
     def step(
         self,
         user_input: str,
@@ -759,13 +787,19 @@ class ApexAgent:
     ) -> str:
         self._in_reasoning = False
 
+        # Sanitizar histórico em memória para garantir compatibilidade com templates Jinja
+        for idx in range(1, len(self.history)):
+            if self.history[idx].get("role") == "system":
+                self.history[idx]["role"] = "user"
+                self.history[idx]["content"] = f"[INFORMAÇÃO DE CONTEXTO DO SISTEMA]:\n{self.history[idx].get('content', '')}"
+
         # Recuperar da memoria vetorial o que foi arquivado em compactacoes
         # anteriores. Inserido ANTES da mensagem do utilizador, para garantir
         # que a conversa termina sempre com role: "user" (evita quebrar templates Jinja/OpenAI).
         recalled = self._recall_from_rag(user_input)
         if recalled:
             self.history.append({
-                "role": "system",
+                "role": "user",
                 "content": ("[MEMORIA DE SESSOES ANTERIORES - trechos recuperados do "
                             "historico arquivado. Usa-os se forem relevantes para a "
                             "tarefa atual; se nao forem, ignora-os.]\n\n" + recalled),
@@ -818,7 +852,7 @@ class ApexAgent:
             turns += 1
             request_kwargs = {
                 "model": self.model_name,
-                "messages": self.history,
+                "messages": self._sanitize_messages(self.history),
                 "temperature": self.temperature,
                 "stream": True,
                 # Sem isto o servidor nao manda contagem nenhuma. Ver _capture_usage.
@@ -837,6 +871,38 @@ class ApexAgent:
                 stream = self.client.chat.completions.create(**request_kwargs)
             except Exception as e:
                 err_str = str(e).lower()
+
+                # Se for erro de conexao na porta 8080, tentar ressuscitar o servidor se estiver offline
+                if ("connection" in err_str or "connecterror" in err_str or "refused" in err_str) and "8080" in self.base_url:
+                    try:
+                        from apex_harness.server import discover_local_ggufs
+                        from apex_harness.optimized_launcher import launch_llama_server
+                        models = discover_local_ggufs()
+                        target_path = None
+                        for m in models.values():
+                            if m.get("filename") == self.model_name or os.path.basename(m.get("path", "")) == self.model_name:
+                                target_path = m["path"]
+                                break
+                        if not target_path:
+                            target_path = "/run/media/leonardo/Windows/AIModels/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q3_K_S.gguf"
+                        if os.path.exists(target_path):
+                            if on_chunk:
+                                on_chunk("🔄 Backend local (porta 8080) estava offline. Reiniciando servidor...\n")
+                            proc, _, log_path = launch_llama_server(target_path, port=8080, context=65536, log_to_file=True)
+                            for _ in range(60):
+                                time.sleep(1.0)
+                                try:
+                                    req = urllib.request.Request("http://127.0.0.1:8080/v1/models", headers={"User-Agent": "ApexHarness"})
+                                    with urllib.request.urlopen(req, timeout=1.5) as resp:
+                                        if resp.status == 200:
+                                            break
+                                except Exception:
+                                    pass
+                            request_kwargs["messages"] = self._sanitize_messages(self.history)
+                            stream = self.client.chat.completions.create(**request_kwargs)
+                            err_str = ""
+                    except Exception:
+                        pass
 
                 # Um backend que nao conheca `stream_options` recusaria o pedido
                 # TODO. A contagem de tokens e um extra, nao pode custar a
@@ -859,12 +925,12 @@ class ApexAgent:
                     self.compact()
                     try:
                         if active_tools:
-                            request_kwargs["messages"] = self.history
+                            request_kwargs["messages"] = self._sanitize_messages(self.history)
                             stream = self.client.chat.completions.create(**request_kwargs)
                         else:
                             stream = self.client.chat.completions.create(
                                 model=self.model_name,
-                                messages=self.history,
+                                messages=self._sanitize_messages(self.history),
                                 temperature=self.temperature,
                                 stream=True
                             )
@@ -874,7 +940,7 @@ class ApexAgent:
                             try:
                                 stream = self.client.chat.completions.create(
                                     model=self.model_name,
-                                    messages=self.history,
+                                    messages=self._sanitize_messages(self.history),
                                     tools=self.tools,
                                     tool_choice="auto",
                                     temperature=self.temperature,
@@ -884,12 +950,12 @@ class ApexAgent:
                                 return f"⚠️ Limite de contexto do servidor excedido ({final_err}). Use /clear para reiniciar."
                         else:
                             return f"⚠️ Limite de contexto do servidor excedido ({retry_err}). Use /clear para reiniciar."
-                else:
+                elif err_str:
                     # Fallback to non-streaming if server rejects streaming tools
                     try:
                         resp = self.client.chat.completions.create(
                             model=self.model_name,
-                            messages=self.history,
+                            messages=self._sanitize_messages(self.history),
                             temperature=self.temperature
                         )
                         content = resp.choices[0].message.content or ""

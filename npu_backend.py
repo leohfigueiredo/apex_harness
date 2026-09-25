@@ -47,15 +47,18 @@ class NPUServerManager:
         return f"http://{self.host}:{self.port}/v1"
 
     def is_running(self) -> bool:
-        """Check if server process is alive."""
-        if self.process is None:
+        """Check if server process is alive (via Popen or port probe)."""
+        if self.process is not None and self.process.poll() is None:
+            return True
+        try:
+            req = urllib.request.Request(f"{self.api_base}/models", headers={"User-Agent": "ApexHarness-NPU"})
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
+                return resp.getcode() == 200
+        except Exception:
             return False
-        return self.process.poll() is None
 
     def check_health(self, timeout: float = 1.0) -> bool:
         """Ping the server /v1/models endpoint."""
-        if not self.is_running():
-            return False
         try:
             url = f"{self.api_base}/models"
             req = urllib.request.Request(url, headers={"User-Agent": "ApexHarness-NPU"})
@@ -105,13 +108,21 @@ class NPUServerManager:
             # Ensure AMD NPU drivers and libraries are recognized
             env["AMDNPU_ENABLE_SVA"] = "1"
 
+            def _set_rlimits():
+                try:
+                    import resource
+                    resource.setrlimit(resource.RLIMIT_MEMLOCK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+                except Exception:
+                    pass
+
             self.process = subprocess.Popen(
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                env=env
+                env=env,
+                preexec_fn=_set_rlimits
             )
 
             if wait_ready:
@@ -132,7 +143,16 @@ class NPUServerManager:
             return False
 
     def stop(self) -> None:
-        """Gracefully stop the server process and close log file."""
+        """Gracefully stop the server process, unload NPU model, and close log file."""
+        # 1. Unload all models from NPU first
+        try:
+            lem_bin = shutil.which("lemonade") or os.path.expanduser("~/.local/bin/lemonade")
+            if os.path.isfile(lem_bin) and os.access(lem_bin, os.X_OK):
+                subprocess.run([lem_bin, "unload"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+        # 2. Terminate the child process if managed by Popen
         if self.process is not None and self.process.poll() is None:
             try:
                 self.process.terminate()
@@ -143,6 +163,12 @@ class NPUServerManager:
                 except Exception:
                     pass
         self.process = None
+
+        # 3. Clean up any external lemond process running on the same port
+        try:
+            subprocess.run(["pkill", "-f", f"lemond.*--port {self.port}"], capture_output=True, text=True, timeout=3)
+        except Exception:
+            pass
 
         if self.log_file is not None:
             try:

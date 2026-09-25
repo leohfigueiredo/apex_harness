@@ -141,12 +141,16 @@
           </div>
           <div class="mcp-selector-wrapper">
             <label for="mcp-select" data-i18n="tools">🔌 Ferramentas:</label>
-            <select id="mcp-select" class="select-dropdown" title="Escolha Modo Turbo (rápido) ou carregamento de MCPs">
+            <select id="mcp-select" class="select-dropdown" data-i18n-title="mcp_select_title" title="Escolha Modo Turbo (rápido) ou carregamento de MCPs">
               <option value="turbo" data-i18n="turbo_opt">⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)</option>
               <option value="all" data-i18n="all_opt">🔌 Todos MCPs (Carregados)</option>
             </select>
-            <button id="btn-open-mcp-modal" class="btn-sm" data-i18n="configure_btn" title="Gerenciar servidores MCP individualmente">⚙️ Configurar</button>
+            <button id="btn-open-mcp-modal" class="btn-sm" data-i18n="configure_btn" data-i18n-title="configure_btn_title" title="Gerenciar servidores MCP individualmente">⚙️ Configurar</button>
           </div>
+          <button id="btn-npu-toggle" class="btn btn-npu" title="Ativar aceleração heterogênea por hardware na NPU AMD XDNA2 (Critic e Subagentes)">
+            <span class="dot" id="npu-status-dot"></span>
+            <span id="npu-btn-text">⚡ NPU Offload: Desligada</span>
+          </button>
           <button id="btn-clear" class="btn btn-secondary" data-i18n="clear_context">Limpar Contexto</button>
           <div class="lang-selector-wrapper">
             <button id="btn-lang-toggle" class="btn-lang" title="Mudar Idioma / Switch Language">
@@ -253,7 +257,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <h3 data-i18n="mcp_modal_title">🔌 Gerenciador de Ferramentas MCP</h3>
-        <button id="btn-close-mcp-modal" class="btn-icon" title="Fechar">✕</button>
+        <button id="btn-close-mcp-modal" class="btn-icon" data-i18n-title="close_modal" title="Fechar">✕</button>
       </div>
       <div class="modal-body">
         <p class="modal-desc" data-i18n="mcp_modal_desc">

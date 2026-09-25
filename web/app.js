@@ -90,7 +90,12 @@ document.addEventListener('DOMContentLoaded', () => {
       tools: "🔌 Ferramentas:",
       turbo_opt: "⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)",
       all_opt: "🔌 Todos MCPs (Carregados)",
+      all_opt_count: "🔌 Todos MCPs ({count} servidores)",
+      server_group: "Servidor específico",
+      server_only: "📦 Só {server}",
+      mcp_select_title: "Escolha Modo Turbo (rápido) ou carregamento de MCPs",
       configure_btn: "⚙️ Configurar",
+      configure_btn_title: "Gerenciar servidores MCP individualmente",
       clear_context: "Limpar Contexto",
       input_placeholder: "Digite sua mensagem ou comando (pressione Enter para enviar, Shift+Enter para nova linha)...",
       send: "Enviar",
@@ -105,6 +110,18 @@ document.addEventListener('DOMContentLoaded', () => {
       mcp_btn_turbo: "⚡ Modo Turbo (Desligar Todos)",
       mcp_btn_all: "🔌 Selecionar Todos",
       mcp_btn_save: "Salvar e Aplicar",
+      close_modal: "Fechar",
+      badge_mcp: "Servidor MCP",
+      mcp_descriptions: {
+        "notebooks": "Inspeção e execução de Jupyter Notebooks",
+        "visualization": "Renderização de gráficos e dashboards visuais",
+        "data-agent-kit": "Consultas e operações GCP / Data Cloud",
+        "memory": "Grafo de conhecimento e persistência de entidades",
+        "sequential-thinking": "Raciocínio dinâmico e resolução de problemas passo a passo",
+        "ollama": "Conexão com modelos locais e embeddings Ollama",
+        "hyperresearch": "Pesquisa, indexação e notas de investigação",
+        "default": "Servidor de ferramentas externas MCP"
+      },
       model_online: "Modelo: Online",
       model_offline: "Modelo: Offline",
       model_checking: "Modelo: Verificando...",
@@ -140,7 +157,12 @@ document.addEventListener('DOMContentLoaded', () => {
       tools: "🔌 Tools:",
       turbo_opt: "⚡ Turbo Mode (No MCPs, ~4.2 t/s)",
       all_opt: "🔌 All MCPs (Loaded)",
+      all_opt_count: "🔌 All MCPs ({count} servers)",
+      server_group: "Specific server",
+      server_only: "📦 Only {server}",
+      mcp_select_title: "Choose Turbo Mode (fast) or load MCPs",
       configure_btn: "⚙️ Configure",
+      configure_btn_title: "Manage MCP servers individually",
       clear_context: "Clear Context",
       input_placeholder: "Type your message or command (press Enter to send, Shift+Enter for newline)...",
       send: "Send",
@@ -155,6 +177,18 @@ document.addEventListener('DOMContentLoaded', () => {
       mcp_btn_turbo: "⚡ Turbo Mode (Disable All)",
       mcp_btn_all: "🔌 Select All",
       mcp_btn_save: "Save & Apply",
+      close_modal: "Close",
+      badge_mcp: "MCP Server",
+      mcp_descriptions: {
+        "notebooks": "Jupyter Notebook inspection and execution",
+        "visualization": "Charts and visual dashboard rendering",
+        "data-agent-kit": "GCP / Data Cloud operations and queries",
+        "memory": "Knowledge graph and persistent memory entities",
+        "sequential-thinking": "Step-by-step dynamic reasoning and problem solving",
+        "ollama": "Connector for local models and Ollama embeddings",
+        "hyperresearch": "Research note search, indexing, and backlinks",
+        "default": "External MCP tool server"
+      },
       model_online: "Model: Online",
       model_offline: "Model: Offline",
       model_checking: "Model: Checking...",
@@ -197,6 +231,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const langText = document.getElementById('lang-text');
     if (langFlag) langFlag.textContent = dict.lang_flag;
     if (langText) langText.textContent = dict.lang_name;
+
+    if (cachedMcpData) {
+      renderMcpSelect(cachedMcpData);
+      renderMcpChecklist(cachedMcpData);
+    }
   }
 
   const btnLangToggle = document.getElementById('btn-lang-toggle');
@@ -214,7 +253,9 @@ document.addEventListener('DOMContentLoaded', () => {
   loadMcp();
   loadSessions();
   loadStatus();
+  loadNpuStatus();
   setInterval(loadStatus, 4000);
+  setInterval(loadNpuStatus, 5000);
 
   // Watchdog: se isGenerating ficou preso (sem stream ativo há > 90 s), resetar.
   // Isto acontece quando o servidor reinicia, a ligação cai silenciosamente, ou
@@ -527,44 +568,56 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/mcp');
       const data = await res.json();
       cachedMcpData = data;
-      mcpSelect.innerHTML = '';
-
-      const optTurbo = document.createElement('option');
-      optTurbo.value = 'turbo';
-      optTurbo.textContent = '⚡ Modo Turbo (Sem MCPs, ~4.2 t/s)';
-      mcpSelect.appendChild(optTurbo);
-
-      const optAll = document.createElement('option');
-      optAll.value = 'all';
-      const count = (data.available_servers || []).length;
-      optAll.textContent = `🔌 Todos MCPs (${count} servidores)`;
-      mcpSelect.appendChild(optAll);
-
-      if (data.available_servers && data.available_servers.length > 0) {
-        const group = document.createElement('optgroup');
-        group.label = 'Servidor específico';
-        data.available_servers.forEach(s => {
-          const opt = document.createElement('option');
-          opt.value = `server:${s}`;
-          opt.textContent = `📦 Só ${s}`;
-          group.appendChild(opt);
-        });
-        mcpSelect.appendChild(group);
-      }
-
-      if (data.mode === 'turbo') {
-        mcpSelect.value = 'turbo';
-      } else if (data.mode === 'all') {
-        mcpSelect.value = 'all';
-      } else if (data.enabled_servers && data.enabled_servers.length === 1) {
-        mcpSelect.value = `server:${data.enabled_servers[0]}`;
-      } else {
-        mcpSelect.value = 'all';
-      }
-
-      renderMcpChecklist(data);
+      renderMcpSelect(cachedMcpData);
+      renderMcpChecklist(cachedMcpData);
     } catch (err) {
       console.warn('Erro ao carregar MCPs:', err);
+    }
+  }
+
+  function renderMcpSelect(data) {
+    if (!mcpSelect || !data) return;
+    const dict = translations[currentLang] || translations.pt;
+    const currentVal = mcpSelect.value;
+
+    mcpSelect.innerHTML = '';
+    mcpSelect.title = dict.mcp_select_title || "Escolha Modo Turbo (rápido) ou carregamento de MCPs";
+
+    const optTurbo = document.createElement('option');
+    optTurbo.value = 'turbo';
+    optTurbo.textContent = dict.turbo_opt;
+    mcpSelect.appendChild(optTurbo);
+
+    const optAll = document.createElement('option');
+    optAll.value = 'all';
+    const count = (data.available_servers || []).length;
+    const allTpl = dict.all_opt_count || (currentLang === 'en' ? '🔌 All MCPs ({count} servers)' : '🔌 Todos MCPs ({count} servidores)');
+    optAll.textContent = allTpl.replace('{count}', count);
+    mcpSelect.appendChild(optAll);
+
+    if (data.available_servers && data.available_servers.length > 0) {
+      const group = document.createElement('optgroup');
+      group.label = dict.server_group || (currentLang === 'en' ? 'Specific server' : 'Servidor específico');
+      data.available_servers.forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = `server:${s}`;
+        const onlyTpl = dict.server_only || (currentLang === 'en' ? '📦 Only {server}' : '📦 Só {server}');
+        opt.textContent = onlyTpl.replace('{server}', s);
+        group.appendChild(opt);
+      });
+      mcpSelect.appendChild(group);
+    }
+
+    if (currentVal && Array.from(mcpSelect.options).some(o => o.value === currentVal)) {
+      mcpSelect.value = currentVal;
+    } else if (data.mode === 'turbo') {
+      mcpSelect.value = 'turbo';
+    } else if (data.mode === 'all') {
+      mcpSelect.value = 'all';
+    } else if (data.enabled_servers && data.enabled_servers.length === 1) {
+      mcpSelect.value = `server:${data.enabled_servers[0]}`;
+    } else {
+      mcpSelect.value = 'all';
     }
   }
 
@@ -573,6 +626,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!list || !data || !data.available_servers) return;
     list.innerHTML = '';
 
+    const dict = translations[currentLang] || translations.pt;
+    const descs = dict.mcp_descriptions || {};
     const enabledSet = new Set(data.mode === 'turbo' ? [] : (data.enabled_servers || []));
 
     data.available_servers.forEach(serverName => {
@@ -587,16 +642,27 @@ document.addEventListener('DOMContentLoaded', () => {
       chk.value = serverName;
       chk.checked = enabledSet.has(serverName);
 
+      const info = document.createElement('div');
+      info.className = 'mcp-item-info';
+
       const label = document.createElement('span');
       label.className = 'mcp-item-name';
       label.textContent = serverName;
 
+      const desc = document.createElement('span');
+      desc.className = 'mcp-item-desc';
+      const customDesc = data.server_descriptions && data.server_descriptions[serverName];
+      desc.textContent = customDesc || descs[serverName] || descs['default'] || (currentLang === 'en' ? 'External MCP tool server' : 'Servidor de ferramentas externas MCP');
+
+      info.appendChild(label);
+      info.appendChild(desc);
+
       left.appendChild(chk);
-      left.appendChild(label);
+      left.appendChild(info);
 
       const badge = document.createElement('span');
       badge.className = 'mcp-item-badge';
-      badge.textContent = 'MCP Server';
+      badge.textContent = dict.badge_mcp || (currentLang === 'en' ? 'MCP Server' : 'Servidor MCP');
 
       item.appendChild(left);
       item.appendChild(badge);
@@ -662,7 +728,8 @@ document.addEventListener('DOMContentLoaded', () => {
         payload = { mode: 'custom', servers: checkedServers };
       }
 
-      if (mcpModalStatus) mcpModalStatus.textContent = 'Salvando...';
+      const dict = translations[currentLang] || translations.pt;
+      if (mcpModalStatus) mcpModalStatus.textContent = dict.saving;
 
       try {
         const res = await fetch('/api/mcp', {
@@ -671,13 +738,13 @@ document.addEventListener('DOMContentLoaded', () => {
           body: JSON.stringify(payload)
         });
         const d = await res.json();
-        if (mcpModalStatus) mcpModalStatus.textContent = '✅ Configuração salva!';
+        if (mcpModalStatus) mcpModalStatus.textContent = dict.save_success;
         await loadMcp();
         setTimeout(() => {
           if (mcpModal) mcpModal.style.display = 'none';
         }, 600);
       } catch (err) {
-        if (mcpModalStatus) mcpModalStatus.textContent = '❌ Erro: ' + err.message;
+        if (mcpModalStatus) mcpModalStatus.textContent = (currentLang === 'en' ? '❌ Error: ' : '❌ Erro: ') + err.message;
       }
     });
   }
@@ -707,6 +774,70 @@ document.addEventListener('DOMContentLoaded', () => {
         await loadMcp();
       } catch (err) {
         alert('Erro ao alterar MCP: ' + err.message);
+      }
+    });
+  }
+
+  // ── NPU Accelerator Toggle & Polling ─────────────────────────
+  const btnNpuToggle = document.getElementById('btn-npu-toggle');
+  const npuStatusDot = document.getElementById('npu-status-dot');
+  const npuBtnText = document.getElementById('npu-btn-text');
+  let npuIsActive = false;
+
+  async function loadNpuStatus() {
+    if (!btnNpuToggle) return;
+    try {
+      const res = await fetch('/api/npu');
+      const data = await res.json();
+      npuIsActive = Boolean(data.active);
+
+      if (npuStatusDot && npuBtnText) {
+        if (data.active) {
+          btnNpuToggle.classList.add('active');
+          btnNpuToggle.classList.remove('loading');
+          npuStatusDot.className = 'dot green';
+          npuBtnText.textContent = `⚡ NPU Ativa (${data.loaded_model || 'qwen3-0.6b-FLM'})`;
+          btnNpuToggle.title = `NPU AMD XDNA2 acelerando hardware na porta 8090. Clique para desativar e liberar RAM.`;
+        } else {
+          btnNpuToggle.classList.remove('active');
+          btnNpuToggle.classList.remove('loading');
+          npuStatusDot.className = 'dot';
+          npuBtnText.textContent = '⚡ NPU Offload: Desligada';
+          btnNpuToggle.title = 'Clique para ativar aceleração heterogênea na NPU AMD XDNA2 (Critic & Subagentes)';
+        }
+      }
+    } catch (err) {
+      console.warn('Erro ao checar status NPU:', err);
+    }
+  }
+
+  if (btnNpuToggle) {
+    btnNpuToggle.addEventListener('click', async () => {
+      btnNpuToggle.classList.add('loading');
+      const targetAction = npuIsActive ? 'stop' : 'start';
+      if (npuBtnText) {
+        npuBtnText.textContent = npuIsActive ? 'Desativando NPU...' : 'Ativando NPU na porta 8090...';
+      }
+
+      try {
+        const res = await fetch('/api/npu', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: targetAction, model: 'qwen3-0.6b-FLM' })
+        });
+        const d = await res.json();
+        if (d.status === 'ok') {
+          appendSystemNotification(d.active 
+            ? `⚡ <strong>NPU AMD XDNA2 Ativada!</strong> Tarefas de Crítica e Triagem agora rodam com zero impacto na Radeon 890M.`
+            : `💤 <strong>NPU Desativada.</strong> Memória RAM 100% liberada.`
+          );
+        } else {
+          alert('Erro na NPU: ' + (d.message || 'Falha ao comunicar com Lemonade'));
+        }
+      } catch (err) {
+        alert('Erro ao alternar NPU: ' + err.message);
+      } finally {
+        await loadNpuStatus();
       }
     });
   }

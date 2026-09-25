@@ -5,6 +5,7 @@ reasoning traces (<think>), model hot-swapping, /btw side-notes, and session his
 """
 
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -142,6 +143,108 @@ def _resolve_lm_model(requested: str) -> Optional[str]:
     return None
 
 
+_DISCOVERED_GGUF_CACHE: Dict[str, Any] = {"ts": 0.0, "models": {}}
+
+
+def _clean_model_label(fname: str) -> str:
+    name = fname
+    if name.endswith(".gguf"):
+        name = name[:-5]
+    quant_m = re.search(r"[-_.]([Qq][0-9]+_[A-Za-z0-9_]+|[Qq][0-9]+_[0-9]+|[Qq][0-9]+[A-Za-z0-9_]+|[Ff]16|[Ff]32)$", name)
+    if quant_m:
+        quant = quant_m.group(1).upper()
+        base = name[:quant_m.start()]
+        return f"{base} ({quant})"
+    return name
+
+
+def discover_local_ggufs(force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Varre discos e pastas locais procurando modelos GGUF válidos instalados."""
+    now = time.time()
+    if not force and (now - _DISCOVERED_GGUF_CACHE["ts"]) < 15.0 and _DISCOVERED_GGUF_CACHE["models"]:
+        return _DISCOVERED_GGUF_CACHE["models"]
+
+    search_dirs = [
+        Path("/run/media/leonardo/Windows/AIModels"),
+        Path(os.path.expanduser("~/.lmstudio/models")),
+        Path("/mnt/HDD/AIModels"),
+        Path("/mnt/Windows/AIModels"),
+    ]
+    media_root = Path("/run/media/leonardo")
+    if media_root.is_dir():
+        for d in media_root.glob("*/AIModels"):
+            if d not in search_dirs:
+                search_dirs.append(d)
+
+    found: Dict[str, Dict[str, Any]] = {}
+    visited_inodes = set()
+
+    for base_dir in search_dirs:
+        if not base_dir.is_dir():
+            continue
+        for root, dirs, files in os.walk(base_dir, followlinks=True):
+            if "/." in root or "__" in root:
+                continue
+            for f in files:
+                if not f.endswith(".gguf"):
+                    continue
+                f_lower = f.lower()
+                if "mmproj" in f_lower or "imatrix" in f_lower:
+                    continue
+                full_path = Path(root) / f
+                try:
+                    if not full_path.is_file():
+                        continue
+                    real_path = full_path.resolve()
+                    if not real_path.exists():
+                        continue
+                    stat = real_path.stat()
+                    inode_key = (stat.st_dev, stat.st_ino)
+                    if inode_key in visited_inodes:
+                        continue
+                    visited_inodes.add(inode_key)
+
+                    sz_bytes = stat.st_size
+                    sz_gb = round(sz_bytes / (1024**3), 2)
+                    if sz_gb < 0.2 or sz_gb > 45.0:
+                        continue
+
+                    fname = real_path.name
+                    has_vision = False
+                    try:
+                        from apex_harness.hwtune import find_mmproj
+                        has_vision = bool(find_mmproj(str(real_path)))
+                    except Exception:
+                        pass
+
+                    label = _clean_model_label(fname)
+                    found[fname] = {
+                        "key": fname,
+                        "label": label,
+                        "filename": fname,
+                        "path": str(real_path),
+                        "size_bytes": sz_bytes,
+                        "size_gb": sz_gb,
+                        "vision": has_vision,
+                    }
+                except Exception:
+                    pass
+
+    _DISCOVERED_GGUF_CACHE.update({"ts": now, "models": found})
+    return found
+
+
+def _get_llama_server_active_props(base_url: str = "http://127.0.0.1:8080") -> Dict[str, Any]:
+    """Obtém propriedades do modelo atualmente carregado no llama-server via /props."""
+    host_port = base_url.rstrip("/").rsplit("/v1", 1)[0]
+    try:
+        req = urllib.request.Request(f"{host_port}/props", headers={"User-Agent": "ApexHarness"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return {}
+
+
 
 class ApexWebHandler(BaseHTTPRequestHandler):
     """HTTP & SSE Handler for Apex Harness Web UI."""
@@ -201,6 +304,8 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_get_project()
         elif url_path == "/api/status":
             self._handle_get_status()
+        elif url_path == "/api/npu":
+            self._handle_get_npu()
         elif url_path == "/api/wiki":
             self._handle_get_wiki()
         elif url_path == "/api/ping":
@@ -236,6 +341,8 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_post_session_rename(data)
         elif url_path == "/api/mcp":
             self._handle_post_mcp(data)
+        elif url_path == "/api/npu":
+            self._handle_post_npu(data)
         elif url_path == "/api/btw":
             self._handle_post_btw(data)
         elif url_path == "/api/clear":
@@ -316,17 +423,9 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "error", "message": str(e)}, status=500)
 
     def _handle_get_models(self):
-        """Lista de modelos NORMALIZADA.
+        """Lista de modelos NORMALIZADA e COMPLETA.
 
-        Antes isto misturava QUATRO esquemas de nomes diferentes -- modelKeys do
-        LM Studio ("swift-qwen3.8-27b@q4_k_m"), nomes de ficheiro GGUF
-        ("Swift-Qwen3.8-27B-Q4_K_M.gguf"), caminhos com barras
-        ("prism-ml/.../x.gguf") -- sem deduplicar. O mesmo modelo aparecia duas
-        vezes, e como a troca de modelo so aceitava modelKeys, metade das opcoes
-        da lista nao carregavam nada.
-
-        Agora: UMA entrada por modelo, sempre com a modelKey como valor, o nome
-        amigavel no label, e os metadados que o `lms ls --json` ja oferece.
+        Lista todos os modelos locais GGUF instalados no sistema e/ou no LM Studio.
         """
         agent = _GLOBAL_AGENT or ApexAgent()
 
@@ -335,7 +434,6 @@ class ApexWebHandler(BaseHTTPRequestHandler):
         active_url = detect_active_api_base(agent.base_url)
         if active_url != agent.base_url:
             agent.base_url = active_url
-            # CORRIGIDO: `OpenAI` nao estava importado -> NameError aqui -> HTTP 500.
             agent.client = OpenAI(
                 base_url=agent.base_url, api_key=agent.api_key,
                 timeout=httpx.Timeout(5.0, read=600.0, write=60.0, pool=60.0),
@@ -352,7 +450,18 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                 entries[key]["label"] = label
             entries[key].update({k: v for k, v in meta.items() if v is not None})
 
-        # 2. Modelos do LM Studio (fonte principal: traz metadados ricos).
+        # 2. Modelos GGUF locais encontrados no disco (garante catálogo sempre completo)
+        local_models = discover_local_ggufs()
+        for fname, minfo in local_models.items():
+            _add(
+                fname,
+                label=minfo.get("label", fname),
+                path=minfo.get("path"),
+                size_gb=minfo.get("size_gb"),
+                vision=minfo.get("vision", False),
+            )
+
+        # 3. Modelos do LM Studio (se daemon ativo, enriquece com metadados)
         by_base, keys = _lms_models()
         rc, out, _err = _lms("ls", "--json")
         if rc == 0 and out.strip():
@@ -379,26 +488,28 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        # 3. O que o endpoint OpenAI do backend anuncia (llama-server, ou LM
-        #    Studio se o `lms ls` falhou).
-        try:
-            raw = urllib.request.urlopen(f"{agent.base_url}/models", timeout=3).read()
-            for m in json.loads(raw).get("data", []):
-                mid = m.get("id")
-                if not mid:
-                    continue
-                # Traduzir nome de ficheiro -> modelKey, para nao duplicar.
-                _add(_resolve_lm_model(mid) or mid, label=os.path.basename(mid))
-        except Exception:
-            pass
+        # 4. Detectar o modelo ativo
+        active = None
+        if "8080" in agent.base_url:
+            props = _get_llama_server_active_props(agent.base_url)
+            mpath = props.get("model_path")
+            if mpath:
+                fname = os.path.basename(mpath)
+                if fname in entries:
+                    active = fname
+                else:
+                    active = _resolve_lm_model(fname) or fname
 
-        # 4. O modelo ativo tem de estar sempre presente.
-        if agent.model_name:
-            _add(_resolve_lm_model(agent.model_name) or agent.model_name)
+        if not active:
+            active = _resolve_lm_model(agent.model_name) or agent.model_name
+
+        if active:
+            if active not in entries:
+                _add(active, label=os.path.basename(active))
+            if agent.model_name in ("llama-local-model", "", None):
+                agent.model_name = active
 
         available = list(entries.keys())
-        # Ativo primeiro, para o <select> o mostrar no topo.
-        active = _resolve_lm_model(agent.model_name) or agent.model_name
         if active in available:
             available.remove(active)
             available.insert(0, active)
@@ -489,7 +600,19 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                     hstatus = health.get("status")
                     if hstatus == "ok":
                         status, load_pct = "ready", 100
-                        loaded_model = agent.model_name
+                        try:
+                            praw = urllib.request.urlopen(f"{probe}/props", timeout=1.0).read()
+                            pdata = json.loads(praw)
+                            m_p = pdata.get("model_path")
+                            if m_p:
+                                real_name = os.path.basename(m_p)
+                                if agent.model_name in ("llama-local-model", "", None):
+                                    agent.set_model(real_name)
+                                loaded_model = real_name
+                        except Exception:
+                            pass
+                        if not loaded_model:
+                            loaded_model = agent.model_name
                         break
                     if hstatus == "loading model":
                         status, load_pct = "loading", 50
@@ -659,11 +782,16 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             mgr = get_mcp_manager()
 
             all_servers = []
+            server_descriptions = {}
             if mgr.config_path and mgr.config_path.exists():
                 try:
                     with open(mgr.config_path, "r", encoding="utf-8") as f:
                         cdata = json.load(f)
-                        all_servers = list(cdata.get("mcpServers", {}).keys())
+                        servers_dict = cdata.get("mcpServers", {})
+                        all_servers = list(servers_dict.keys())
+                        for s_k, s_v in servers_dict.items():
+                            if isinstance(s_v, dict) and "description" in s_v:
+                                server_descriptions[s_k] = s_v["description"]
                 except Exception:
                     pass
             if not all_servers:
@@ -684,6 +812,7 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                 "mode": mode,
                 "available_servers": all_servers,
                 "enabled_servers": enabled,
+                "server_descriptions": server_descriptions,
                 "total_tools": len(agent.tools),
                 "mcp_tools_count": len(mcp_tool_names),
                 "mcp_tools": mcp_tool_names
@@ -746,112 +875,340 @@ class ApexWebHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
+    def _handle_get_npu(self):
+        """Devolve estado da NPU, Lemonade e modelos carregados."""
+        try:
+            from apex_harness.npu_detect import npu_available
+            from apex_harness.npu_backend import get_npu_manager
+            st = npu_available()
+            mgr = get_npu_manager()
+            is_active = mgr.check_health(timeout=0.6)
+
+            loaded_model = None
+            if is_active:
+                try:
+                    res = subprocess.run(["lemonade", "status"], capture_output=True, text=True, timeout=2)
+                    lines = res.stdout.splitlines()
+                    for idx, line in enumerate(lines):
+                        if line.startswith("Model ") or "Recipe" in line:
+                            # Procura modelo carregado nas linhas seguintes
+                            for subline in lines[idx+1:]:
+                                s = subline.strip()
+                                if s and not s.startswith("-") and "No models loaded" not in s:
+                                    parts = s.split()
+                                    if len(parts) >= 6 and "ready" in parts:
+                                        loaded_model = parts[0]
+                                        break
+                                    elif len(parts) >= 1:
+                                        loaded_model = parts[0]
+                                        break
+                except Exception:
+                    pass
+
+            is_really_loaded = bool(loaded_model)
+
+            self._send_json({
+                "usable": st.usable,
+                "driver_loaded": st.driver_loaded,
+                "lemonade_installed": st.lemonade_installed,
+                "fastflowlm_available": st.fastflowlm_available,
+                "active": is_really_loaded,
+                "server_up": is_active,
+                "endpoint": mgr.api_base if is_active else None,
+                "loaded_model": loaded_model,
+                "default_model": "qwen3-0.6b-FLM"
+            })
+        except Exception as e:
+            self._send_json({"usable": False, "active": False, "error": str(e)})
+
+    def _handle_post_npu(self, data: Dict[str, Any]):
+        """Ligue ou desliga a NPU / Lemonade sob demanda."""
+        action = (data.get("action") or "").lower().strip()
+        model_name = (data.get("model") or "qwen3-0.6b-FLM").strip()
+
+        try:
+            from apex_harness.npu_backend import get_npu_manager
+            mgr = get_npu_manager()
+
+            if action in ["start", "load", "enable", "on"]:
+                if not mgr.is_running() and not mgr.check_health(timeout=0.5):
+                    mgr.start(wait_ready=True, ready_timeout=8.0)
+
+                # Carrega o modelo
+                res = subprocess.run(["lemonade", "load", model_name], capture_output=True, text=True, timeout=25)
+                if res.returncode == 0:
+                    self._send_json({
+                        "status": "ok",
+                        "active": True,
+                        "loaded_model": model_name,
+                        "message": f"NPU ativada com '{model_name}'. Critic e Subagentes agora acelerados por hardware!"
+                    })
+                else:
+                    err_msg = (res.stderr or res.stdout).strip()
+                    self._send_json({
+                        "status": "error",
+                        "active": False,
+                        "message": f"Falha ao carregar na NPU: {err_msg}"
+                    }, status=400)
+
+            elif action in ["stop", "unload", "disable", "off"]:
+                try:
+                    subprocess.run(["lemonade", "unload"], capture_output=True, text=True, timeout=8)
+                except Exception:
+                    pass
+                mgr.stop()
+                self._send_json({
+                    "status": "ok",
+                    "active": False,
+                    "loaded_model": None,
+                    "message": "NPU desativada e memória RAM 100% liberada."
+                })
+            else:
+                self._send_json({"error": "Ação inválida. Use 'start' ou 'stop'."}, status=400)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
     def _handle_post_model(self, data: Dict[str, Any]):
-        """Troca de modelo — agora VERIFICADA.
-
-        O bug grave que isto corrige: `ApexAgent.set_model()` apenas muda uma
-        string; nao carrega nada. E o `lms load` so era tentado quando o nome
-        coincidia exatamente com uma modelKey do LM Studio. Como o /api/models
-        oferecia maioritariamente NOMES DE FICHEIRO, escolher um modelo na
-        pratica nao fazia nada -- e mesmo assim o servidor respondia
-        `{"status": "ok", "message": "Modelo alterado com sucesso"}`.
-
-        Agora: resolve o nome -> modelKey, carrega, e CONFIRMA com `lms ps`.
-        So devolve ok se o modelo pedido estiver mesmo carregado.
-        """
+        """Troca de modelo no LM Studio ou no llama-server nativo."""
         requested = (data.get("model", "") or "").strip()
         agent = _GLOBAL_AGENT or ApexAgent()
         if not requested:
-            self._send_json({"status": "error", "message": "Nome de modelo invalido"}, status=400)
+            self._send_json({"status": "error", "message": "Nome de modelo inválido"}, status=400)
             return
 
         if "mmproj" in requested.lower():
             self._send_json({
                 "status": "error",
-                "message": (f"'{requested}' e um projetor de visao multimodal (mmproj), "
-                            "nao um modelo de linguagem. Escolhe o modelo principal.")
+                "message": (f"'{requested}' é um projetor de visão multimodal (mmproj), "
+                            "não um modelo de linguagem. Escolha o modelo principal.")
             }, status=400)
             return
 
-        _lms_models(force=True)          # refresh, pode ter entrado modelo novo
-        model_key = _resolve_lm_model(requested)
-        currently = _lms_loaded()
+        # Verificar se o LM Studio está ativo
+        lms_running = False
+        if "1234" in agent.base_url:
+            lms_running = True
+        else:
+            rc_ps, out_ps, _ = _lms("ps")
+            if rc_ps == 0 and "Error" not in out_ps and "daemon is not running" not in out_ps:
+                lms_running = True
 
-        # Se ja e o modelo carregado, nao vale a pena recarregar.
-        if model_key and currently and model_key == currently:
-            agent.set_model(model_key)
-            self._send_json({"status": "ok", "message": f"'{model_key}' ja estava carregado.",
-                             "active": agent.model_name, "base_url": agent.base_url,
-                             "verified": True})
-            return
+        if lms_running:
+            _lms_models(force=True)
+            model_key = _resolve_lm_model(requested)
+            currently = _lms_loaded()
 
-        if not model_key:
-            # Se nao esta no catalogo do LM Studio, permite definir como modelo do agente (llama-server externo / testes)
-            agent.set_model(requested)
-            self._send_json({
-                "status": "ok",
-                "message": f"Modelo alterado para '{requested}'.",
-                "active": agent.model_name,
-                "base_url": agent.base_url,
-                "verified": False
-            })
-            return
+            if model_key and currently and model_key == currently:
+                agent.set_model(model_key)
+                self._send_json({"status": "ok", "message": f"'{model_key}' já estava carregado.",
+                                 "active": agent.model_name, "base_url": agent.base_url,
+                                 "verified": True})
+                return
 
-        # CRITICO: `lms load` NAO substitui o modelo carregado -- cria uma
-        # INSTANCIA NOVA. Sem descarregar primeiro, ficam varios modelos presos
-        # em RAM ao mesmo tempo e o carregamento acaba a falhar por pressao de
-        # memoria. A UI apresenta UM modelo ativo, logo: descarregar tudo, carregar um.
-        loaded_ids = [m.get("identifier") or m.get("modelKey") for m in _lms_ps_list()]
-        loaded_ids = [i for i in loaded_ids if i]
-        if loaded_ids:
-            rc_u, out_u, err_u = _lms("unload", "--all", timeout=180)
-            if rc_u != 0:
+            if not model_key:
+                agent.set_model(requested)
+                self._send_json({
+                    "status": "ok",
+                    "message": f"Modelo alterado para '{requested}'.",
+                    "active": agent.model_name,
+                    "base_url": agent.base_url,
+                    "verified": False
+                })
+                return
+
+            loaded_ids = [m.get("identifier") or m.get("modelKey") for m in _lms_ps_list()]
+            loaded_ids = [i for i in loaded_ids if i]
+            if loaded_ids:
+                rc_u, out_u, err_u = _lms("unload", "--all", timeout=180)
+                if rc_u != 0:
+                    self._send_json({
+                        "status": "error",
+                        "message": (f"Não consegui descarregar o modelo atual "
+                                    f"({', '.join(loaded_ids)}); detalhe: {((err_u or out_u) or '').strip()[:200]}"),
+                    }, status=400)
+                    return
+
+            rc, out, err = _lms("load", model_key, timeout=600)
+            if rc != 0:
+                detail = (err or out).strip()
+                self._send_json({"status": "error", "message": f"Falha ao carregar '{model_key}': {detail[:300]}"}, status=400)
+                return
+
+            after = [m.get("identifier") or m.get("modelKey") for m in _lms_ps_list()]
+            after = [i for i in after if i]
+            if model_key not in after:
                 self._send_json({
                     "status": "error",
-                    "message": (f"Nao consegui descarregar o modelo atual "
-                                f"({', '.join(loaded_ids)}); nao vou carregar outro para "
-                                f"nao esgotar a RAM. Detalhe: {((err_u or out_u) or '').strip()[:200]}"),
+                    "message": (f"O LM Studio não confirmou a troca: pedido '{model_key}', "
+                                f"carregado '{', '.join(after) or 'nada'}'."),
                 }, status=400)
                 return
 
-        # Carregar de facto.
-        rc, out, err = _lms("load", model_key, timeout=600)
-        if rc != 0:
-            detail = (err or out).strip()
-            if "invalid ggml type 142" in detail:
-                msg = (f"'{model_key}' usa quantizacao ternaria (ggml type 142), nao suportada "
-                       "pelo runtime do LM Studio. Usa o fork da PrismML (github.com/PrismML-Eng/llama.cpp).")
-            elif "exited before becoming healthy" in detail:
-                msg = f"'{model_key}' nao arrancou saudavel. Detalhe: {detail[:300]}"
-            elif "memory" in detail.lower() or "ram" in detail.lower():
-                msg = (f"'{model_key}' precisa de mais RAM do que a disponivel. "
-                       f"Fecha outros programas ou usa um quant menor. Detalhe: {detail[:200]}")
-            else:
-                msg = f"Falha ao carregar '{model_key}': {detail[:300]}"
-            self._send_json({"status": "error", "message": msg}, status=400)
+            agent.set_model(model_key)
+            agent.base_url = "http://127.0.0.1:1234/v1"
+            agent.client = OpenAI(
+                base_url=agent.base_url, api_key=agent.api_key,
+                timeout=httpx.Timeout(5.0, read=600.0, write=60.0, pool=60.0),
+            )
+            self._send_json({
+                "status": "ok",
+                "message": f"Modelo carregado e confirmado no LM Studio: {model_key}",
+                "active": agent.model_name,
+                "base_url": agent.base_url,
+                "verified": True,
+            })
             return
 
-        # VERIFICAR. Sem isto, voltariamos a mentir ao utilizador.
-        after = [m.get("identifier") or m.get("modelKey") for m in _lms_ps_list()]
-        after = [i for i in after if i]
-        if model_key not in after:
+        # -------------------------------------------------------------
+        # Backend nativo llama-server (porta 8080)
+        # -------------------------------------------------------------
+        local_models = discover_local_ggufs(force=True)
+        target_info = None
+        target_path = None
+
+        if requested in local_models:
+            target_info = local_models[requested]
+            target_path = target_info["path"]
+        else:
+            req_base = os.path.basename(requested).lower()
+            for k, v in local_models.items():
+                if k.lower() == req_base or os.path.basename(v["path"]).lower() == req_base:
+                    target_info = v
+                    target_path = v["path"]
+                    break
+            if not target_path and os.path.isfile(requested):
+                target_path = requested
+                target_info = {
+                    "key": os.path.basename(requested),
+                    "label": _clean_model_label(os.path.basename(requested)),
+                    "filename": os.path.basename(requested),
+                    "path": requested,
+                }
+
+        if not target_path or not os.path.exists(target_path):
             self._send_json({
                 "status": "error",
-                "message": (f"O LM Studio nao confirmou a troca: pedido '{model_key}', "
-                            f"carregado '{', '.join(after) or 'nada'}'."),
-            }, status=400)
+                "message": f"Ficheiro do modelo '{requested}' não foi encontrado no disco."
+            }, status=404)
             return
 
-        agent.set_model(model_key)
-        agent.base_url = "http://127.0.0.1:1234/v1"
+        model_label = target_info.get("label", os.path.basename(target_path))
+        model_fname = target_info.get("filename", os.path.basename(target_path))
+
+        # Verificar se já está carregado no llama-server
+        currently_loaded = None
+        try:
+            props = _get_llama_server_active_props(agent.base_url)
+            if props.get("model_path"):
+                currently_loaded = os.path.realpath(props["model_path"])
+        except Exception:
+            pass
+
+        if currently_loaded and currently_loaded == os.path.realpath(target_path):
+            agent.set_model(model_fname)
+            agent.base_url = "http://127.0.0.1:8080/v1"
+            self._send_json({
+                "status": "ok",
+                "message": f"'{model_label}' já está ativo e pronto.",
+                "active": model_fname,
+                "base_url": agent.base_url,
+                "verified": True,
+            })
+            return
+
+        # Validar no memguard antes de carregar (previne kernel panic / OOM global)
+        try:
+            from apex_harness.memguard import check as memguard_check, VERDICT_REFUSE
+            plan = memguard_check(target_path, ctx=65536, kv_type="q8_0")
+            if plan.verdict == VERDICT_REFUSE:
+                reason = plan.reasons[0] if plan.reasons else "Memória RAM/VRAM insuficiente"
+                self._send_json({
+                    "status": "error",
+                    "message": f"Modelo RECUSADO pelo memguard (proteção contra travamento): {reason}"
+                }, status=400)
+                return
+        except Exception:
+            pass
+
+        # Encerrar llama-server anterior
+        subprocess.run(["pkill", "-15", "-f", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(40):
+            time.sleep(0.1)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=0.2):
+                    pass
+            except Exception:
+                break
+        else:
+            subprocess.run(["pkill", "-9", "-f", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+
+        # Iniciar novo llama-server com otimização Strix Point
+        try:
+            from apex_harness.optimized_launcher import launch_llama_server
+            proc, log_file, log_path = launch_llama_server(
+                target_path,
+                port=8080,
+                context=65536,
+                log_to_file=True,
+                verbose=True,
+            )
+
+            pid_file = "/home/leonardo/apex_harness/benchmarks/resultados/backend_8080.pid"
+            try:
+                with open(pid_file, "w") as f:
+                    f.write(str(proc.pid))
+            except Exception:
+                pass
+        except Exception as launch_err:
+            self._send_json({
+                "status": "error",
+                "message": f"Erro ao iniciar processo do llama-server: {launch_err}"
+            }, status=500)
+            return
+
+        # Aguardar servidor ficar saudável e carregar pesos
+        ready = False
+        for _ in range(120):
+            time.sleep(1.0)
+            if proc.poll() is not None:
+                tail = ""
+                try:
+                    with open(log_path, "r", errors="ignore") as lf:
+                        tail = "".join(lf.readlines()[-15:])
+                except Exception:
+                    pass
+                self._send_json({
+                    "status": "error",
+                    "message": f"Falha no llama-server ao carregar '{model_label}': {tail[:300]}"
+                }, status=500)
+                return
+            try:
+                req = urllib.request.Request("http://127.0.0.1:8080/v1/models", headers={"User-Agent": "ApexHarness"})
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if resp.status == 200:
+                        ready = True
+                        break
+            except Exception:
+                pass
+
+        if not ready:
+            self._send_json({
+                "status": "error",
+                "message": f"Timeout (120s) aguardando o modelo '{model_label}' carregar."
+            }, status=504)
+            return
+
+        agent.base_url = "http://127.0.0.1:8080/v1"
+        agent.set_model(model_fname)
         agent.client = OpenAI(
             base_url=agent.base_url, api_key=agent.api_key,
             timeout=httpx.Timeout(5.0, read=600.0, write=60.0, pool=60.0),
         )
         self._send_json({
             "status": "ok",
-            "message": f"Modelo carregado e confirmado: {model_key}",
-            "active": agent.model_name,
+            "message": f"Modelo '{model_label}' carregado e pronto no llama-server!",
+            "active": model_fname,
             "base_url": agent.base_url,
             "verified": True,
         })
@@ -1155,4 +1512,11 @@ if __name__ == "__main__":
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nEncerrando servidor web.")
+        print("\nEncerrando servidor web...")
+    finally:
+        try:
+            from apex_harness.npu_backend import get_npu_manager
+            get_npu_manager().stop()
+        except Exception:
+            pass
+        print("✓ Servidor web e recursos de NPU descarregados com sucesso.")
