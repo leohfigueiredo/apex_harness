@@ -17,10 +17,11 @@ Convenience wrappers for harness integration:
   - ask_guardrail(model_output)           → JevAnswer (pass bool)
 
 Backend priority:
-  1. llama-server @ 127.0.0.1:8091 (dedicated Jev sidecar)
-  2. llama-server @ 127.0.0.1:8090 (alternative sidecar port)
-  3. LM Studio    @ 127.0.0.1:1234
-  4. Ollama       @ 127.0.0.1:11434 (fallback)
+  1. DecisionForge / Clef System 1 Sidecar @ 127.0.0.1:8501 (/v1/systemone)
+  2. Dedicated Clef Sidecar                @ 127.0.0.1:8091 (/v1/systemone)
+  3. NPU XDNA2 (Lemonade / FastFlowLM)     @ 127.0.0.1:8090
+  4. Local Ollama                          @ 127.0.0.1:11434 (fallback)
+  5. LM Studio                             @ 127.0.0.1:1234
 
 All calls are non-blocking: the caller gets a Future and can .result() when ready.
 The main generation loop is never stalled.
@@ -29,6 +30,7 @@ The main generation loop is never stalled.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.request
@@ -38,32 +40,102 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration: Clef-Flash-9B & NPU XDNA2 Architecture
 # ---------------------------------------------------------------------------
 
-_JEV_ENDPOINTS: List[Dict[str, str]] = [
-    {
-        # Jev primário: sidecar dedicado via llama-server (4 threads isoladas, baixa latência)
-        "name":   "llama-server-jev-8091",
-        "api":    "http://127.0.0.1:8091/v1",
-        "model":  "jev-local",
+CLEF_FLASH_LOCAL_PATH = os.environ.get(
+    "APEX_CLEF_PATH",
+    "/run/media/leonardo/C69ADBDF9ADBCA57/AIModels/bartowski/Cloudflare_clef-flash-GGUF/Cloudflare_clef-flash-Q4_K_M.gguf"
+)
+DEFAULT_CLEF_MODEL = os.environ.get("APEX_CLEF_MODEL", "clef-flash")
+DEFAULT_CLEF_NPU_MODEL = os.environ.get("APEX_CLEF_NPU_MODEL", "qwen3.5-9b-npu2")
+
+
+def get_jev_endpoints() -> List[Dict[str, str]]:
+    """
+    Build dynamic prioritized list of decision backends:
+      1. DecisionForge / Clef System 1 sidecar (@ port 8501 or APEX_DECISION_URL).
+      2. NPU XDNA2 (Lemonade / FastFlowLM @ port 8090) if usable.
+      3. Dedicated Clef sidecar (llama-server / systemone @ port 8091).
+      4. Local Ollama (clef-flash @ port 11434).
+      5. LM Studio (clef-flash / Qwen @ port 1234).
+      6. Primary local LLM server fallback (port 8080/8000).
+    """
+    endpoints: List[Dict[str, str]] = []
+
+    # 1. DecisionForge Clef System 1 Sidecar (/v1/systemone)
+    decision_url = os.environ.get("APEX_DECISION_URL", "http://127.0.0.1:8501").rstrip("/")
+    decision_model = os.environ.get("APEX_DECISION_MODEL", "models/apex_guard_05b")
+    endpoints.append({
+        "name": "DecisionForge-System1-8501",
+        "api": decision_url,
+        "model": decision_model,
+        "format": "systemone",
+    })
+    if decision_url != "http://127.0.0.1:8091":
+        endpoints.append({
+            "name": "DecisionForge-System1-8091",
+            "api": "http://127.0.0.1:8091",
+            "model": decision_model,
+            "format": "systemone",
+        })
+
+    use_npu = os.environ.get("APEX_USE_NPU_JEV", "1").lower() in ("1", "true", "yes")
+
+    # 1. NPU XDNA2 check (port 8090)
+    if use_npu:
+        try:
+            from apex_harness.npu_detect import npu_available
+            from apex_harness.npu_backend import route_request, get_npu_manager
+            status = npu_available()
+            if status.usable:
+                endpoints.append({
+                    "name": "NPU-XDNA2-Lemonade-8090",
+                    "api": "http://127.0.0.1:8090/v1",
+                    "model": DEFAULT_CLEF_NPU_MODEL,
+                    "format": "openai",
+                })
+        except Exception:
+            pass
+
+    # 2. Dedicated Clef-9B sidecar (port 8091)
+    endpoints.append({
+        "name": "llama-server-clef-8091",
+        "api": "http://127.0.0.1:8091/v1",
+        "model": DEFAULT_CLEF_MODEL,
         "format": "openai",
-    },
-    {
-        # Sidecar alternativo na porta 8090
-        "name":   "llama-server-jev-8090",
-        "api":    "http://127.0.0.1:8090/v1",
-        "model":  "jev-local",
+    })
+
+    # 3. Local Ollama with clef-flash (port 11434)
+    endpoints.append({
+        "name": "Ollama-clef-flash",
+        "api": "http://127.0.0.1:11434/v1",
+        "model": "clef-flash",
         "format": "openai",
-    },
-    {
-        # Fallback LM Studio
-        "name":   "LMStudio-Qwen3.8-4B-distilled",
-        "api":    "http://127.0.0.1:1234/v1",
-        "model":  "qwen3.8_4b_distilled_gguf",
+    })
+
+    # 4. LM Studio with clef-flash (port 1234)
+    endpoints.append({
+        "name": "LMStudio-clef-flash",
+        "api": "http://127.0.0.1:1234/v1",
+        "model": DEFAULT_CLEF_MODEL,
         "format": "openai",
-    },
-]
+    })
+
+    # 5. Primary server fallback
+    fallback_base = os.environ.get("OPENAI_API_BASE", "http://127.0.0.1:8000/v1").rstrip("/")
+    endpoints.append({
+        "name": "primary-server-fallback",
+        "api": fallback_base,
+        "model": os.environ.get("APEX_PRIMARY_MODEL", "local-llm"),
+        "format": "openai",
+    })
+
+    return endpoints
+
+
+# Backward-compatible endpoint list
+_JEV_ENDPOINTS: List[Dict[str, str]] = get_jev_endpoints()
 
 _JEV_SYSTEM_PROMPT = (
     "Você é um motor de decisão, não um assistente de chat. Você NUNCA explica, "
@@ -85,7 +157,23 @@ _JEV_SYSTEM_PROMPT = (
 
 _JEV_MAX_TOKENS  = 256
 _JEV_TEMPERATURE = 0.0
-_JEV_TIMEOUT_SEC = 6.0
+_JEV_TIMEOUT_SEC = 12.0
+
+
+def _detect_hardware_label(backend_name: str) -> str:
+    """Classify backend into human-readable hardware source."""
+    low = backend_name.lower()
+    if "decisionforge" in low or "system1" in low:
+        return "Clef Joint Schema Head (System 1)"
+    if "npu" in low or "8090" in low or "xdna" in low:
+        return "NPU AMD XDNA2 (Lemonade 8090)"
+    if "ollama" in low:
+        return "Ollama (Clef-Flash 9B)"
+    if "1234" in low or "lmstudio" in low:
+        return "LM Studio (Clef-Flash 9B)"
+    if "clef" in low or "8091" in low:
+        return "Clef-Flash 9B (Dedicated Sidecar)"
+    return "GPU/CPU Fallback"
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -98,6 +186,7 @@ class JevChoice:
     confidence:    float = 1.0
     latency_ms:    float = 0.0
     backend:       str   = ""
+    hardware:      str   = ""
     ok:            bool  = True
     raw:           str   = ""
     error:         Optional[str] = None
@@ -110,6 +199,7 @@ class JevScore:
     confidence:    float = 1.0
     latency_ms:    float = 0.0
     backend:       str   = ""
+    hardware:      str   = ""
     ok:            bool  = True
     raw:           str   = ""
     error:         Optional[str] = None
@@ -121,6 +211,7 @@ class JevNoul:
     confidence:      float = 1.0
     latency_ms:      float = 0.0
     backend:         str   = ""
+    hardware:        str   = ""
     ok:              bool  = True
     raw:             str   = ""
     error:           Optional[str] = None
@@ -137,6 +228,7 @@ class JevPermit:
     confidence: float = 1.0
     latency_ms: float = 0.0
     backend:    str   = ""
+    hardware:   str   = ""
     ok:         bool  = True
 
 
@@ -147,6 +239,7 @@ class JevAnswer:
     confidence: float = 1.0
     latency_ms: float = 0.0
     backend:    str   = ""
+    hardware:   str   = ""
     ok:         bool  = True
     error:      Optional[str] = None
 
@@ -175,6 +268,24 @@ def _extract_json(text: str) -> Optional[Dict]:
     return None
 
 
+def _resolve_target_model(ep: Dict[str, str]) -> str:
+    """Probe /models to detect active model or fallback to configured model."""
+    model = ep.get("model", DEFAULT_CLEF_MODEL)
+    try:
+        url = f"{ep['api'].rstrip('/')}/models"
+        req = urllib.request.Request(url, headers={"User-Agent": "ApexHarness-Jev"})
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models_list = data.get("data", [])
+            if models_list and isinstance(models_list, list):
+                mid = models_list[0].get("id")
+                if mid:
+                    return str(mid)
+    except Exception:
+        pass
+    return model
+
+
 def _call_openai(api: str, model: str, system: str, user: str, timeout: float) -> str:
     payload = {
         "model":       model,
@@ -189,7 +300,7 @@ def _call_openai(api: str, model: str, system: str, user: str, timeout: float) -
     }
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
-        f"{api}/chat/completions",
+        f"{api.rstrip('/')}/chat/completions",
         data=data,
         headers={"Content-Type": "application/json"},
     )
@@ -211,7 +322,7 @@ def _call_ollama(api: str, model: str, system: str, user: str, timeout: float) -
     }
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
-        f"{api}/api/chat",
+        f"{api.rstrip('/')}/api/chat",
         data=data,
         headers={"Content-Type": "application/json"},
     )
@@ -220,16 +331,92 @@ def _call_ollama(api: str, model: str, system: str, user: str, timeout: float) -
     return body["message"]["content"].strip()
 
 
-def _jev_call(system: str, user: str) -> Tuple[str, str, float]:
+def _call_systemone(
+    api: str,
+    model: str,
+    req_type: str,
+    state: str,
+    question: str,
+    criteria: Any,
+    timeout: float,
+) -> str:
+    """Send structured request to DecisionForge Clef /v1/systemone endpoint."""
+    if req_type == "choice":
+        crit_dict = {opt: opt for opt in criteria} if isinstance(criteria, list) else (criteria or {})
+        q_def = {"type": "choice", "instructions": question, "criteria": crit_dict}
+    elif req_type == "score":
+        q_def = {"type": "score", "instructions": question, "criteria": criteria or {}}
+    elif req_type == "noul":
+        q_def = {"type": "noul", "instructions": question}
+    else:
+        q_def = {"type": "choice", "instructions": question, "criteria": {}}
+
+    payload = {
+        "model": model,
+        "state": state,
+        "questions": {"q": q_def},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api.rstrip('/')}/v1/systemone",
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "ApexHarness-Jev"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+
+    ans = body.get("answers", {}).get("q", {})
+    ans_type = ans.get("type", req_type)
+
+    if ans_type == "choice":
+        return json.dumps({
+            "type": "choice",
+            "selected": ans.get("choice", ""),
+            "confidence": ans.get("confidence", 1.0),
+            "probabilities": ans.get("probabilities", {}),
+        })
+    elif ans_type == "score":
+        return json.dumps({
+            "type": "score",
+            "value": ans.get("score", 0.0),
+            "confidence": ans.get("confidence", 1.0),
+            "probabilities": ans.get("probabilities", {}),
+        })
+    elif ans_type == "noul":
+        return json.dumps({
+            "type": "noul",
+            "probability_yes": ans.get("noul", 0.0),
+            "confidence": ans.get("confidence", 1.0),
+        })
+
+    return json.dumps(ans)
+
+
+def _jev_call(
+    system: str,
+    user: str,
+    req_type: str = "choice",
+    state: str = "",
+    question: str = "",
+    criteria: Any = None,
+) -> Tuple[str, str, float]:
     """Try each backend in order. Returns (raw_output, backend_name, latency_ms)."""
+    endpoints = get_jev_endpoints()
     last_err: Exception = RuntimeError("No backends configured")
-    for ep in _JEV_ENDPOINTS:
+    for ep in endpoints:
         t0 = time.perf_counter()
         try:
-            if ep["format"] == "openai":
-                raw = _call_openai(ep["api"], ep["model"], system, user, _JEV_TIMEOUT_SEC)
+            if ep["format"] == "systemone":
+                target_model = ep.get("model", "models/apex_guard_05b")
+                st = state if state else user
+                q = question if question else "Avaliação de decisão"
+                raw = _call_systemone(ep["api"], target_model, req_type, st, q, criteria, timeout=3.0)
             else:
-                raw = _call_ollama(ep["api"], ep["model"], system, user, _JEV_TIMEOUT_SEC)
+                target_model = _resolve_target_model(ep)
+                if ep["format"] == "openai":
+                    raw = _call_openai(ep["api"], target_model, system, user, _JEV_TIMEOUT_SEC)
+                else:
+                    raw = _call_ollama(ep["api"], target_model, system, user, _JEV_TIMEOUT_SEC)
             latency_ms = (time.perf_counter() - t0) * 1000.0
             return raw, ep["name"], latency_ms
         except Exception as exc:
@@ -269,7 +456,7 @@ class JevDecider:
         def _run() -> JevChoice:
             t0 = time.perf_counter()
             try:
-                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt)
+                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt, req_type="choice", state=state, question=question, criteria=options)
                 parsed = _extract_json(raw)
                 if parsed and parsed.get("type") == "choice":
                     selected = str(parsed.get("selected", fallback_option))
@@ -283,6 +470,7 @@ class JevDecider:
                         confidence=confidence,
                         latency_ms=latency,
                         backend=backend,
+                        hardware=_detect_hardware_label(backend),
                         ok=True,
                         raw=raw,
                     )
@@ -293,6 +481,7 @@ class JevDecider:
                     confidence=0.0,
                     latency_ms=latency,
                     backend="fallback",
+                    hardware="Fallback",
                     ok=False,
                     error=str(exc),
                 )
@@ -319,7 +508,7 @@ class JevDecider:
         def _run() -> JevScore:
             t0 = time.perf_counter()
             try:
-                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt)
+                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt, req_type="score", state=state, question=question, criteria=scale)
                 parsed = _extract_json(raw)
                 if parsed and parsed.get("type") == "score":
                     val = float(parsed.get("value", 0.0))
@@ -331,6 +520,7 @@ class JevDecider:
                         confidence=confidence,
                         latency_ms=latency,
                         backend=backend,
+                        hardware=_detect_hardware_label(backend),
                         ok=True,
                         raw=raw,
                     )
@@ -341,6 +531,7 @@ class JevDecider:
                     confidence=0.0,
                     latency_ms=latency,
                     backend="fallback",
+                    hardware="Fallback",
                     ok=False,
                     error=str(exc),
                 )
@@ -365,7 +556,7 @@ class JevDecider:
         def _run() -> JevNoul:
             t0 = time.perf_counter()
             try:
-                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt)
+                raw, backend, latency = _jev_call(_JEV_SYSTEM_PROMPT, user_prompt, req_type="noul", state=state, question=question, criteria=None)
                 parsed = _extract_json(raw)
                 if parsed and parsed.get("type") == "noul":
                     prob = float(parsed.get("probability_yes", 0.0))
@@ -375,6 +566,7 @@ class JevDecider:
                         confidence=confidence,
                         latency_ms=latency,
                         backend=backend,
+                        hardware=_detect_hardware_label(backend),
                         ok=True,
                         raw=raw,
                     )
@@ -385,6 +577,7 @@ class JevDecider:
                     confidence=0.0,
                     latency_ms=latency,
                     backend="fallback",
+                    hardware="Fallback",
                     ok=False,
                     error=str(exc),
                 )
@@ -415,6 +608,7 @@ class JevDecider:
                 confidence=res.confidence,
                 latency_ms=res.latency_ms,
                 backend=res.backend,
+                hardware=res.hardware,
                 ok=res.ok,
             )
 
@@ -434,6 +628,7 @@ class JevDecider:
                 confidence=res.confidence,
                 latency_ms=res.latency_ms,
                 backend=res.backend,
+                hardware=res.hardware,
                 ok=res.ok,
                 error=res.error,
             )
@@ -462,7 +657,7 @@ class JevDecider:
         self._pool.shutdown(wait=wait)
 
     def __repr__(self) -> str:
-        backends = ", ".join(ep["name"] for ep in _JEV_ENDPOINTS)
+        backends = ", ".join(ep["name"] for ep in get_jev_endpoints())
         return f"JevDecider(backends=[{backends}])"
 
 

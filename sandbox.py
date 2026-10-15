@@ -9,11 +9,68 @@ Supports:
 
 import os
 import shutil
+import signal
 import subprocess
+import tempfile
 import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+
+
+def run_shell(
+    argv: List[str],
+    cwd: Optional[str] = None,
+    timeout: int = 60,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str, int, bool]:
+    """
+    Corre um comando sem nunca pendurar o harness. Devolve
+    (stdout, stderr, exit_code, timed_out).
+
+    Porque nao `subprocess.run(capture_output=True, timeout=...)`:
+    com `cmd &` (ex.: `npm run dev &`, `uvicorn ... &`) o filho em background
+    herda o PIPE de stdout. O bash sai logo, mas o `communicate()` so termina
+    no EOF do pipe -- que nunca chega enquanto o servidor estiver vivo. Pior:
+    no timeout o `run()` mata so o bash e volta a chamar `communicate()`, que
+    fica bloqueado PARA SEMPRE. O turno do agente morria em silencio.
+
+    Aqui:
+      * stdout/stderr vao para ficheiros temporarios (nao ha pipe para segurar);
+      * esperamos so pelo processo principal, nao pelos netos;
+      * `start_new_session=True` + `killpg` no timeout mata a arvore toda;
+      * stdin = /dev/null, para um prompt interactivo (y/N) nao esperar input.
+    """
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=out_f,
+            stderr=err_f,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+        def _ler(f) -> str:
+            f.seek(0)
+            return f.read().decode("utf-8", errors="replace")
+
+        rc = proc.returncode if proc.returncode is not None else 124
+        return _ler(out_f), _ler(err_f), (124 if timed_out else rc), timed_out
 
 
 @dataclass
@@ -175,26 +232,15 @@ class SandboxExecutor:
         bwrap_cmd.extend(["/bin/bash", "-c", command])
 
         try:
-            res = subprocess.run(
-                bwrap_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=self.filter_environment()
-            )
-            return SandboxResult(
-                stdout=res.stdout,
-                stderr=res.stderr,
-                exit_code=res.returncode,
-                backend="bwrap"
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                stdout="",
-                stderr=f"Error: Command timed out after {timeout} seconds inside bwrap.",
-                exit_code=124,
-                backend="bwrap"
-            )
+            out, err, rc, timed_out = run_shell(bwrap_cmd, timeout=timeout, env=self.filter_environment())
+            if timed_out:
+                return SandboxResult(
+                    stdout=out,
+                    stderr=f"Error: Command timed out after {timeout} seconds inside bwrap.\n{err}".rstrip(),
+                    exit_code=124,
+                    backend="bwrap"
+                )
+            return SandboxResult(stdout=out, stderr=err, exit_code=rc, backend="bwrap")
         except Exception as e:
             return SandboxResult(
                 stdout="",
@@ -217,26 +263,15 @@ class SandboxExecutor:
         fj_cmd.extend(["/bin/bash", "-c", command])
 
         try:
-            res = subprocess.run(
-                fj_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=self.filter_environment()
-            )
-            return SandboxResult(
-                stdout=res.stdout,
-                stderr=res.stderr,
-                exit_code=res.returncode,
-                backend="firejail"
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                stdout="",
-                stderr=f"Error: Command timed out after {timeout} seconds inside firejail.",
-                exit_code=124,
-                backend="firejail"
-            )
+            out, err, rc, timed_out = run_shell(fj_cmd, timeout=timeout, env=self.filter_environment())
+            if timed_out:
+                return SandboxResult(
+                    stdout=out,
+                    stderr=f"Error: Command timed out after {timeout} seconds inside firejail.\n{err}".rstrip(),
+                    exit_code=124,
+                    backend="firejail"
+                )
+            return SandboxResult(stdout=out, stderr=err, exit_code=rc, backend="firejail")
         except Exception as e:
             return SandboxResult(
                 stdout="",
@@ -258,27 +293,17 @@ class SandboxExecutor:
                 )
 
         try:
-            res = subprocess.run(
-                ["/bin/bash", "-c", command],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=self.filter_environment()
+            out, err, rc, timed_out = run_shell(
+                ["/bin/bash", "-c", command], cwd=cwd, timeout=timeout, env=self.filter_environment()
             )
-            return SandboxResult(
-                stdout=res.stdout,
-                stderr=res.stderr,
-                exit_code=res.returncode,
-                backend="restricted"
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                stdout="",
-                stderr=f"Error: Command timed out after {timeout} seconds.",
-                exit_code=124,
-                backend="restricted"
-            )
+            if timed_out:
+                return SandboxResult(
+                    stdout=out,
+                    stderr=f"Error: Command timed out after {timeout} seconds.\n{err}".rstrip(),
+                    exit_code=124,
+                    backend="restricted"
+                )
+            return SandboxResult(stdout=out, stderr=err, exit_code=rc, backend="restricted")
         except Exception as e:
             return SandboxResult(
                 stdout="",
@@ -290,26 +315,15 @@ class SandboxExecutor:
     def _run_unrestricted(self, command: str, cwd: str, timeout: int) -> SandboxResult:
         """Unrestricted execution (when APEX_SANDBOX_BACKEND=none)."""
         try:
-            res = subprocess.run(
-                ["/bin/bash", "-c", command],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            return SandboxResult(
-                stdout=res.stdout,
-                stderr=res.stderr,
-                exit_code=res.returncode,
-                backend="none"
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                stdout="",
-                stderr=f"Error: Command timed out after {timeout} seconds.",
-                exit_code=124,
-                backend="none"
-            )
+            out, err, rc, timed_out = run_shell(["/bin/bash", "-c", command], cwd=cwd, timeout=timeout)
+            if timed_out:
+                return SandboxResult(
+                    stdout=out,
+                    stderr=f"Error: Command timed out after {timeout} seconds.\n{err}".rstrip(),
+                    exit_code=124,
+                    backend="none"
+                )
+            return SandboxResult(stdout=out, stderr=err, exit_code=rc, backend="none")
         except Exception as e:
             return SandboxResult(
                 stdout="",

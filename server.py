@@ -123,6 +123,46 @@ def _lms_ps_list(force: bool = False) -> List[Dict[str, Any]]:
     return [m for m in data if isinstance(m, dict)] if isinstance(data, list) else []
 
 
+def _extrair_erro_do_log(log_path: str, model_label: str) -> str:
+    """
+    Devolve uma mensagem de erro LIMPA a partir do log do llama-server.
+
+    O `tail` cego do log mostrava os acessos HTTP ("GET /health 200") que o
+    servidor antigo escrevia enquanto morria -- e o erro REAL ficava enterrado.
+    Este helper tira as linhas que falam de erro e, para o caso comum de
+    "unknown model architecture", traduz para uma frase que se percebe.
+    """
+    try:
+        with open(log_path, "r", errors="ignore") as lf:
+            linhas = lf.readlines()[-300:]
+    except Exception:
+        linhas = []
+
+    erros = [l.strip() for l in linhas
+             if re.search(r"\b(error|failed|unable|cannot|invalid|unknown|"
+                          r"address already|exceed|insufficient|out of memory)\b",
+                          l, re.IGNORECASE)
+             and "GET /health" not in l]
+
+    # Caso especifico: arquitetura que este build nao conhece.
+    for l in erros:
+        m = re.search(r"unknown model architecture:\s*'([^']+)'", l, re.IGNORECASE)
+        if m:
+            arch = m.group(1)
+            return (f"O modelo '{model_label}' usa a arquitetura '{arch}', que este "
+                    f"build do llama.cpp nao suporta. Precisas de um build mais recente "
+                    f"(ou do fork que suporta '{arch}').")
+
+    if erros:
+        return f"Falha ao carregar '{model_label}': " + " | ".join(erros[-6:])[:400]
+
+    # Sem linhas de erro explicitas: mostrar o fim do log, mas limpo.
+    limpo = [l.strip() for l in linhas if "GET /health" not in l]
+    tail = " | ".join(limpo[-8:])
+    return f"Falha ao carregar '{model_label}': {tail[:400]}" if tail \
+        else f"Falha ao carregar '{model_label}' (sem detalhe no log)."
+
+
 
 def _resolve_lm_model(requested: str) -> Optional[str]:
     """Traduz o que o utilizador escolheu para uma modelKey do LM Studio."""
@@ -147,15 +187,72 @@ _DISCOVERED_GGUF_CACHE: Dict[str, Any] = {"ts": 0.0, "models": {}}
 
 
 def _clean_model_label(fname: str) -> str:
-    name = fname
+    name = os.path.basename(fname)
     if name.endswith(".gguf"):
         name = name[:-5]
-    quant_m = re.search(r"[-_.]([Qq][0-9]+_[A-Za-z0-9_]+|[Qq][0-9]+_[0-9]+|[Qq][0-9]+[A-Za-z0-9_]+|[Ff]16|[Ff]32)$", name)
+
+    low = name.lower()
+
+    # Detect quantization tag
+    quant = ""
+    quant_m = re.search(r"[-_.]([Qq][0-9]+_[A-Za-z0-9_]+|[Qq][0-9]+_[0-9]+|[Qq][0-9]+[A-Za-z0-9_]+|[Ii][Qq][0-9]+_[A-Za-z0-9_]+|[Ff]16|[Ff]32)$", name)
     if quant_m:
         quant = quant_m.group(1).upper()
-        base = name[:quant_m.start()]
-        return f"{base} ({quant})"
-    return name
+
+    # Intelligent friendly naming preserving clarity & architecture
+    if "swift-1.5" in low or "swift1.5" in low or "swift_1.5" in low:
+        if "flash" in low:
+            label = "Swift 1.5 Qwen Flash-Next 131B"
+        elif "27b" in low:
+            label = "★ Swift 1.5 Qwen 27B"
+        elif "9b" in low:
+            label = "Swift 1.5 Ornith 9B"
+        else:
+            label = "Swift 1.5 Qwen"
+    elif "swift" in low and "27b" in low:
+        label = "Swift Qwen 27B v1"
+    elif "clef" in low or "cloudflare" in low:
+        label = "Clef Flash 9B"
+    elif "claude" in low or "glm-4.7" in low:
+        if "opus" in low:
+            label = "GLM 4.7 Claude Opus Distill 30B"
+        else:
+            label = "GLM 4.7 Flash 30B"
+    elif "nemotron" in low:
+        label = "Nemotron 3.5 Lightning 30B"
+    elif "instinct" in low or ("gemma4" in low and "kimik3" in low):
+        label = "Instinct Gemma 4 Python Coder 12B"
+    elif "diffusiongemma" in low or "diffusion-gemma" in low:
+        label = "Diffusion Gemma 26B"
+    elif "gemma-4-26b" in low or "gemma4-26b" in low:
+        label = "Gemma 4 26B MoE QAT"
+    elif "muse" in low or "glimmer" in low:
+        label = "Muse Glimmer 28B"
+    elif "granite" in low:
+        label = "IBM Granite 4.2 30B"
+    elif "qwen38-keep" in low or ("qwen3.8" in low and "flash-next" in low):
+        label = "Qwen 3.8 Flash-Next 131B"
+    elif "qwen3.6-35b" in low:
+        label = "Qwen 3.6 35B MoE"
+    elif "qwen3-coder-30b" in low:
+        label = "Qwen 3 Coder 30B MoE"
+    elif "qwen3-coder-next" in low:
+        label = "Qwen 3 Coder Next"
+    elif "qwen3-4b" in low or "qwen3.8_4b" in low:
+        label = "Qwen 3 4B Thinking"
+    elif "qwen2.5-coder-7b" in low:
+        label = "Qwen 2.5 Coder 7B"
+    elif "qwen2.5-0.5b" in low:
+        label = "Qwen 2.5 0.5B"
+    elif "deepseek-v4" in low:
+        label = "DeepSeek V4 Flash MoE"
+    else:
+        clean_base = re.sub(r"[-_.]+", " ", name).strip()
+        label = clean_base
+
+    if quant:
+        return f"{label} ({quant})"
+    return label
 
 
 def discover_local_ggufs(force: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -165,6 +262,7 @@ def discover_local_ggufs(force: bool = False) -> Dict[str, Dict[str, Any]]:
         return _DISCOVERED_GGUF_CACHE["models"]
 
     search_dirs = [
+        Path("/run/media/leonardo/C69ADBDF9ADBCA57/AIModels"),
         Path("/run/media/leonardo/Windows/AIModels"),
         Path(os.path.expanduser("~/.lmstudio/models")),
         Path("/mnt/HDD/AIModels"),
@@ -308,6 +406,8 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_get_npu()
         elif url_path == "/api/wiki":
             self._handle_get_wiki()
+        elif url_path == "/api/memory":
+            self._handle_get_memory()
         elif url_path == "/api/ping":
             self._send_json({"ok": True})
         else:
@@ -351,6 +451,8 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             self._handle_post_effort(data)
         elif url_path == "/api/project":
             self._handle_post_project(data)
+        elif url_path == "/api/memory":
+            self._handle_post_memory(data)
         elif url_path == "/api/wiki/compile":
             self._handle_post_wiki_compile(data)
         else:
@@ -510,9 +612,26 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                 agent.model_name = active
 
         available = list(entries.keys())
+        def _model_priority(k: str) -> int:
+            kl = k.lower()
+            if "swift-1.5" in kl and "27b" in kl:
+                return 0 if "q4_k_m" in kl else 1
+            if "swift" in kl and "27b" in kl:
+                return 2
+            if "clef" in kl:
+                return 3
+            if "qwen2.5-coder-7b" in kl:
+                return 4
+            if "coder-30b" in kl:
+                return 5
+            return 20
+
+        available.sort(key=_model_priority)
         if active in available:
             available.remove(active)
             available.insert(0, active)
+        elif not active and available:
+            active = available[0]
 
         self._send_json({
             "active": active,
@@ -1006,6 +1125,10 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                 return
 
             if not model_key:
+                local_models = discover_local_ggufs(force=True)
+                if requested not in local_models and not any(requested.lower() in k.lower() for k in local_models):
+                    self._send_json({"status": "error", "message": f"O modelo '{requested}' não foi encontrado."}, status=404)
+                    return
                 agent.set_model(requested)
                 self._send_json({
                     "status": "ok",
@@ -1130,18 +1253,27 @@ class ApexWebHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        # Encerrar llama-server anterior
-        subprocess.run(["pkill", "-15", "-f", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(40):
-            time.sleep(0.1)
+        # Encerrar o backend que estiver na 8080, QUALQUER que seja.
+        #
+        # Antes era `pkill -f llama-server`, com dois defeitos medidos:
+        #   1. NAO casa com `llama-diffusion-gemma-visual-server` (o nome nao tem
+        #      "llama-server" contiguo) nem com `ollama serve`. A porta 8080
+        #      ficava ocupada e o novo servidor morria com
+        #        OSError: [Errno 98] Address already in use
+        #      -- foi isto que fez o Qwen3.6-35B falhar, mesmo com a arquitetura
+        #      suportada.
+        #   2. Um `pkill -f` cujo padrao aparece na propria linha de comandos mata
+        #      a shell que o executa (ja aconteceu 3x nesta maquina).
+        # fuser -k mata o DONO da porta, que e exactamente quem interessa.
+        subprocess.run(["fuser", "-k", "8080/tcp"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            time.sleep(0.2)
             try:
-                with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=0.2):
+                with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=0.3):
                     pass
             except Exception:
                 break
-        else:
-            subprocess.run(["pkill", "-9", "-f", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.5)
 
         # Iniciar novo llama-server com otimização Strix Point
         try:
@@ -1172,15 +1304,14 @@ class ApexWebHandler(BaseHTTPRequestHandler):
         for _ in range(120):
             time.sleep(1.0)
             if proc.poll() is not None:
-                tail = ""
-                try:
-                    with open(log_path, "r", errors="ignore") as lf:
-                        tail = "".join(lf.readlines()[-15:])
-                except Exception:
-                    pass
+                # O `tail` cego mostrava os LOGS DE ACESSO HTTP ("GET /health 200")
+                # que o servidor antigo a morrer escrevia, nao o erro real. Tira-se
+                # as linhas que falam de erro e mostra-se essas; so se nao houver
+                # nenhuma e que se recorre ao fim do ficheiro.
+                mensagem = _extrair_erro_do_log(log_path, model_label)
                 self._send_json({
                     "status": "error",
-                    "message": f"Falha no llama-server ao carregar '{model_label}': {tail[:300]}"
+                    "message": mensagem
                 }, status=500)
                 return
             try:
@@ -1309,6 +1440,85 @@ class ApexWebHandler(BaseHTTPRequestHandler):
 
         self._send_json({"tokens": max(1, len(texto) // 4), "estimated": True})
 
+    def _handle_get_memory(self):
+        """Devolve o Mermaid Task Canvas e estado da memória L1/L2/L3."""
+        agent = _GLOBAL_AGENT or ApexAgent()
+        try:
+            mem = getattr(agent, "memory", None)
+            if not mem:
+                self._send_json({"enabled": False, "canvas": "", "atoms_count": 0, "persona": ""})
+                return
+
+            canvas_md = mem.canvas() if hasattr(mem, "canvas") else ""
+            ltm = getattr(mem, "ltm", None)
+            atoms_count = ltm.count_atoms() if ltm and hasattr(ltm, "count_atoms") else 0
+            persona = ltm.persona_text() if ltm and hasattr(ltm, "persona_text") else ""
+
+            # Top 10 fatos mais recentes da base L1
+            recent_atoms = []
+            if ltm and hasattr(ltm, "_conn"):
+                try:
+                    with ltm._conn() as conn:
+                        rows = conn.execute(
+                            "SELECT id, category, content as fact, source, ts as created_at FROM l1_atoms ORDER BY id DESC LIMIT 10"
+                        ).fetchall()
+                        recent_atoms = [dict(r) for r in rows]
+                except Exception:
+                    pass
+
+            self._send_json({
+                "enabled": True,
+                "canvas": canvas_md,
+                "atoms_count": atoms_count,
+                "persona": persona,
+                "recent_atoms": recent_atoms,
+            })
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def _handle_post_memory(self, data: Dict[str, Any]):
+        """Ações de memória: search, remember ou drilldown."""
+        agent = _GLOBAL_AGENT or ApexAgent()
+        action = (data.get("action") or "search").lower().strip()
+        mem = getattr(agent, "memory", None)
+        if not mem:
+            self._send_json({"error": "Módulo de memória desativado ou não inicializado."}, status=400)
+            return
+
+        try:
+            if action == "search":
+                q = str(data.get("query") or "").strip()
+                if not q:
+                    self._send_json({"results": []})
+                    return
+                ltm = getattr(mem, "ltm", None)
+                results = ltm.search(q, top_k=int(data.get("top_k", 8))) if ltm else []
+                self._send_json({"results": results})
+            elif action == "remember":
+                fact = str(data.get("fact") or "").strip()
+                category = str(data.get("category") or "general").strip()
+                if not fact:
+                    self._send_json({"error": "Fato não pode ser vazio."}, status=400)
+                    return
+                ltm = getattr(mem, "ltm", None)
+                if not ltm:
+                    self._send_json({"error": "LTM indisponível."}, status=500)
+                    return
+                inserted, atom_id = ltm.add_atom(fact=fact, category=category, source="user_web")
+                self._send_json({"status": "ok", "inserted": inserted, "atom_id": atom_id})
+            elif action == "drilldown":
+                node_id = str(data.get("node_id") or "").strip()
+                if not node_id:
+                    self._send_json({"error": "node_id obrigatório."}, status=400)
+                    return
+                offloader = getattr(mem, "offloader", None)
+                content = offloader.drilldown(node_id) if offloader else "Sem offloader ativo."
+                self._send_json({"node_id": node_id, "content": content})
+            else:
+                self._send_json({"error": f"Ação desconhecida: {action}"}, status=400)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
     def _handle_post_chat(self, data: Dict[str, Any]):
         user_message = (data.get("message") or "").strip()
         images = data.get("images") or []
@@ -1402,6 +1612,26 @@ class ApexWebHandler(BaseHTTPRequestHandler):
             else:
                 send_sse_event("text_chunk", chunk_str)
 
+        def on_tool_start(name: str, args: Dict[str, Any]):
+            # O que mantem a interface viva durante um turno agente: cada chamada
+            # de ferramenta aparece como um evento. Sem isto, quando o modelo
+            # executava 12 ferramentas em sequencia a web ficava MUDO -- "parecia
+            # parado" -- porque so havia eventos de texto e de fim.
+            try:
+                preview = json.dumps(args, ensure_ascii=False)[:300]
+            except Exception:
+                preview = str(args)[:300]
+            send_sse_event("tool_start", json.dumps({"name": name, "args": preview}))
+
+        def on_tool_finish(name: str, result: str):
+            send_sse_event("tool_finish", json.dumps({
+                "name": name,
+                "preview": (result or "")[:200].replace("\n", " "),
+            }, ensure_ascii=False))
+
+        def on_turn(n: int):
+            send_sse_event("turn", json.dumps({"turn": n, "max": agent.max_turns}))
+
         def on_usage(info: Dict[str, Any]):
             # `usage` so com `content` (o cliente le sempre esse campo). Vai
             # antes do `done` para a barra de baixo actualizar no fim do turno.
@@ -1433,7 +1663,10 @@ class ApexWebHandler(BaseHTTPRequestHandler):
                 mem.log_event(sid, "user_message", user_message)
 
             full_response = agent.step(user_input=user_message, on_chunk=on_chunk,
-                                        on_usage=on_usage, images=images)
+                                        on_usage=on_usage, images=images,
+                                        on_tool_start=on_tool_start,
+                                        on_tool_finish=on_tool_finish,
+                                        on_turn=on_turn)
 
             if full_response:
                 if full_response.startswith("API Error:") or full_response.startswith("⚠️"):

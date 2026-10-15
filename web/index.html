@@ -110,8 +110,8 @@
         <div class="header-left">
           <div class="project-selector-wrapper">
             <span class="project-icon">📁</span>
-            <span id="project-path" class="project-path" title="Clique para alterar a pasta de trabalho">Carregando pasta...</span>
-            <button id="btn-change-folder" class="btn-sm" data-i18n="change" title="Alterar pasta de trabalho">Alterar</button>
+            <span id="project-path" class="project-path" data-i18n-title="project_path_title" title="Clique para alterar a pasta de trabalho">Carregando pasta...</span>
+            <button id="btn-change-folder" class="btn-sm" data-i18n="change" data-i18n-title="change_folder_title" title="Alterar pasta de trabalho">Alterar</button>
           </div>
           <div class="model-selector-wrapper">
             <label for="model-select" data-i18n="model">🤖 Modelo:</label>
@@ -122,11 +122,11 @@
         </div>
 
         <div class="header-right">
-          <div class="status-badge" id="model-status-badge" title="Status do Modelo">
+          <div class="status-badge" id="model-status-badge" data-i18n-title="model_status_badge_title" title="Status do Modelo">
             <span class="dot" id="model-status-dot"></span>
-            <span id="model-load-text">Modelo: Verificando...</span>
+            <span id="model-load-text" data-i18n="model_checking">Modelo: Verificando...</span>
           </div>
-          <div class="status-badge" id="context-status-badge" title="Uso do Context Window">
+          <div class="status-badge" id="context-status-badge" data-i18n-title="context_status_badge_title" title="Uso do Context Window">
             <span data-i18n="context_badge">📊 Contexto:</span>
             <span id="context-load-text" class="text-accent">0%</span>
           </div>
@@ -147,13 +147,17 @@
             </select>
             <button id="btn-open-mcp-modal" class="btn-sm" data-i18n="configure_btn" data-i18n-title="configure_btn_title" title="Gerenciar servidores MCP individualmente">⚙️ Configurar</button>
           </div>
-          <button id="btn-npu-toggle" class="btn btn-npu" title="Ativar aceleração heterogênea por hardware na NPU AMD XDNA2 (Critic e Subagentes)">
+          <button id="btn-npu-toggle" class="btn btn-npu" data-i18n-title="npu_btn_title" title="Ativar aceleração heterogênea por hardware na NPU AMD XDNA2 (Critic e Subagentes)">
             <span class="dot" id="npu-status-dot"></span>
             <span id="npu-btn-text">⚡ NPU Offload: Desligada</span>
           </button>
+          <button id="btn-memory-modal" class="btn btn-secondary" data-i18n-title="memory_btn_title" title="Visualizar Memória L1/L2/L3 e Mermaid Task Canvas">
+            <span>🧠</span>
+            <span data-i18n="memory_btn">Memória</span>
+          </button>
           <button id="btn-clear" class="btn btn-secondary" data-i18n="clear_context">Limpar Contexto</button>
           <div class="lang-selector-wrapper">
-            <button id="btn-lang-toggle" class="btn-lang" title="Mudar Idioma / Switch Language">
+            <button id="btn-lang-toggle" class="btn-lang" data-i18n-title="switch_language" title="Mudar Idioma / Switch Language">
               <span id="lang-flag">🇧🇷</span>
               <span id="lang-text">PT</span>
             </button>
@@ -164,13 +168,13 @@
       <!-- Chat History Stream -->
       <div id="chat-stream" class="chat-stream">
         <div class="welcome-card">
-          <h2>⚡ Apex Harness Web Interface</h2>
-          <p>Harness local autônomo conectado ao servidor de inferência. Suporta <strong>/btw</strong> para interrupção de raciocínio e <strong>troca dinamica de modelo mid-task</strong>.</p>
+          <h2 data-i18n="welcome_title">⚡ Apex Harness Web Interface</h2>
+          <p data-i18n="welcome_desc">Harness local autônomo conectado ao servidor de inferência. Suporta <strong>/btw</strong> para interrupção de raciocínio e <strong>troca dinamica de modelo mid-task</strong>.</p>
           <div class="feature-tags">
-            <span class="tag">💡 Interrupção /btw</span>
-            <span class="tag">🔄 Model Hot-Swap</span>
-            <span class="tag">🧠 Reasoning Traces</span>
-            <span class="tag">💾 Session Memory</span>
+            <span class="tag" data-i18n="tag_btw">💡 Interrupção /btw</span>
+            <span class="tag" data-i18n="tag_hotswap">🔄 Model Hot-Swap</span>
+            <span class="tag" data-i18n="tag_traces">🧠 Reasoning Traces</span>
+            <span class="tag" data-i18n="tag_memory">💾 Session Memory</span>
           </div>
         </div>
       </div>
@@ -180,6 +184,7 @@
         <div class="input-box-wrapper">
           <!-- Anexar imagem (requer modelo VL com mmproj) -->
           <button id="btn-attach" class="btn-attach" type="button"
+                  data-i18n-title="attach_image_title"
                   title="Anexar imagem (requer modelo com visão)">
             <span>🖼️</span>
           </button>
@@ -187,6 +192,7 @@
 
           <!-- Anexar ficheiro de texto: funciona com QUALQUER modelo -->
           <button id="btn-attach-file" class="btn-attach" type="button"
+                  data-i18n-title="attach_file_title"
                   title="Anexar ficheiro (código, PDF, CSV, JSON, TXT…) — o conteúdo é injetado no prompt">
             <span>📎</span>
           </button>
@@ -199,7 +205,7 @@
             <span>⏹️</span>
             <span data-i18n="stop">Parar</span>
           </button>
-          <button id="btn-send" class="btn btn-primary">
+          <button id="btn-send" class="btn btn-primary" data-i18n-title="send_btn_normal" title="Enviar mensagem (Enter)">
             <span data-i18n="send">Enviar</span>
             <span class="send-icon">➔</span>
           </button>
@@ -219,29 +225,29 @@
         <div class="vision-warning" id="vision-warning" hidden></div>
 
         <div class="token-bar" id="token-bar">
-          <span class="tok-group" title="O que o modelo lê: contexto da conversa + a mensagem que estás a escrever">
+          <span class="tok-group" data-i18n-title="tok_read_group_title" title="O que o modelo lê: contexto da conversa + a mensagem que estás a escrever">
             <span class="tok-ico">📖</span><span class="tok-label" data-i18n="reading">Leitura</span>
-            <span class="tok-num" id="tok-read-ctx" title="Tokens do contexto (o último prompt enviado ao modelo)">0</span>
+            <span class="tok-num" id="tok-read-ctx" data-i18n-title="tok_read_ctx_title" title="Tokens do contexto (o último prompt enviado ao modelo)">0</span>
             <span class="tok-plus">+</span>
-            <span class="tok-num" id="tok-read-msg" title="Tokens da mensagem que estás a escrever agora">0</span>
+            <span class="tok-num" id="tok-read-msg" data-i18n-title="tok_read_msg_title" title="Tokens da mensagem que estás a escrever agora">0</span>
             <span class="tok-unit">msg</span>
           </span>
 
-          <span class="tok-group" title="O que o modelo escreveu">
+          <span class="tok-group" data-i18n-title="tok_write_group_title" title="O que o modelo escreveu">
             <span class="tok-ico">✍️</span><span class="tok-label" data-i18n="writing">Escrita</span>
-            <span class="tok-num" id="tok-write-last" title="Tokens gerados na última resposta">0</span>
+            <span class="tok-num" id="tok-write-last" data-i18n-title="tok_write_last_title" title="Tokens gerados na última resposta">0</span>
             <span class="tok-unit" data-i18n="last">última</span>
             <span class="tok-plus">·</span>
-            <span class="tok-num" id="tok-write-session" title="Tokens gerados nesta sessão">0</span>
+            <span class="tok-num" id="tok-write-session" data-i18n-title="tok_write_session_title" title="Tokens gerados nesta sessão">0</span>
             <span class="tok-unit" data-i18n="session">sessão</span>
           </span>
 
           <span class="tok-group tok-right">
-            <span id="tok-ctx" title="Uso da janela de contexto do modelo">contexto —</span>
+            <span id="tok-ctx" data-i18n-title="tok_ctx_title" title="Uso da janela de contexto do modelo">contexto —</span>
             <span class="tok-plus">·</span>
-            <span id="tok-speed" title="Velocidade medida pelo próprio servidor de inferência">— t/s</span>
+            <span id="tok-speed" data-i18n-title="tok_speed_title" title="Velocidade medida pelo próprio servidor de inferência">— t/s</span>
             <span class="tok-plus">·</span>
-            <span id="tok-cache" title="Parte do prompt servida do KV cache — é isto que torna o segundo turno muito mais rápido">♻ —</span>
+            <span id="tok-cache" data-i18n-title="tok_cache_title" title="Parte do prompt servida do KV cache — é isto que torna o segundo turno muito mais rápido">♻ —</span>
           </span>
         </div>
 
@@ -274,6 +280,71 @@
       <div class="modal-footer">
         <span id="mcp-modal-status" class="modal-status-text"></span>
         <button id="btn-save-mcp" type="button" class="btn btn-primary" data-i18n="mcp_btn_save">Salvar e Aplicar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal de Memória Hierárquica e Canvas -->
+  <div id="memory-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card memory-modal-card">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-icon">🧠</span>
+          <h3 data-i18n="memory_modal_title">Memória do Agente (TencentDB Architecture)</h3>
+        </div>
+        <button id="btn-close-memory-modal" class="btn-icon" data-i18n-title="close_modal" title="Fechar">✕</button>
+      </div>
+      <div class="modal-body memory-modal-body">
+        <!-- Sub-tabs: Canvas / Fatos L1 / Persona L3 -->
+        <div class="memory-tabs">
+          <button class="mem-tab-btn active" data-tab="canvas">🗺️ Task Canvas (Mermaid)</button>
+          <button class="mem-tab-btn" data-tab="atoms">📚 Fatos Atômicos (L1)</button>
+          <button class="mem-tab-btn" data-tab="persona">👤 Persona (L3)</button>
+          <button class="mem-tab-btn" data-tab="search">🔍 Busca Semântica</button>
+        </div>
+
+        <!-- Tab 1: Mermaid Canvas -->
+        <div id="mem-tab-canvas" class="mem-tab-pane active">
+          <div class="mem-pane-desc">Grafo topológico das ferramentas executadas e estados da tarefa atual:</div>
+          <pre id="mem-canvas-raw" class="mermaid-code-box">Carregando canvas...</pre>
+        </div>
+
+        <!-- Tab 2: Fatos L1 -->
+        <div id="mem-tab-atoms" class="mem-tab-pane">
+          <div class="mem-pane-desc">Fatos consolidados extraídos pelo agente e guardados em SQLite FTS5:</div>
+          <div class="mem-add-atom-bar">
+            <input type="text" id="mem-new-fact-input" placeholder="Guardar novo fato (ex: O usuário prefere respostas diretas)...">
+            <select id="mem-new-fact-cat">
+              <option value="preference">preference</option>
+              <option value="project">project</option>
+              <option value="environment">environment</option>
+              <option value="workflow">workflow</option>
+              <option value="gotcha">gotcha</option>
+              <option value="general" selected>general</option>
+            </select>
+            <button id="btn-mem-add-fact" class="btn btn-sm btn-primary">Salvar Fato</button>
+          </div>
+          <div id="mem-atoms-list" class="mem-atoms-list">Carregando fatos...</div>
+        </div>
+
+        <!-- Tab 3: Persona L3 -->
+        <div id="mem-tab-persona" class="mem-tab-pane">
+          <div class="mem-pane-desc">Perfil contínuo do utilizador e ambiente, injetado no system prompt:</div>
+          <pre id="mem-persona-text" class="persona-text-box">Carregando persona...</pre>
+        </div>
+
+        <!-- Tab 4: Search -->
+        <div id="mem-tab-search" class="mem-tab-pane">
+          <div class="mem-search-bar">
+            <input type="text" id="mem-search-input" placeholder="Pesquisar por BM25 + Vetor...">
+            <button id="btn-mem-search" class="btn btn-sm btn-primary">Buscar</button>
+          </div>
+          <div id="mem-search-results" class="mem-atoms-list"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <span id="mem-stats-text" class="modal-status-text">Memória ativa</span>
+        <button id="btn-mem-refresh" type="button" class="btn btn-secondary">🔄 Atualizar</button>
       </div>
     </div>
   </div>

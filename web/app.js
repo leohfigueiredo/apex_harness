@@ -17,48 +17,30 @@ document.addEventListener('DOMContentLoaded', () => {
   const projectPath = document.getElementById('project-path');
   const btnChangeFolder = document.getElementById('btn-change-folder');
 
-  let currentSessionId = localStorage.getItem('apex_active_session_id') || '';
-  let isGenerating = false;
-  let currentAbortController = null;
-  let generationStartedAt = 0;  // timestamp ms — para o watchdog detectar estado preso
-  let messageQueue = [];
+  // NPU Accelerator elements
+  const btnNpuToggle = document.getElementById('btn-npu-toggle');
+  const npuStatusDot = document.getElementById('npu-status-dot');
+  const npuBtnText = document.getElementById('npu-btn-text');
+  let npuIsActive = false;
 
-  function updateQueueBanner() {
-    if (!queueBanner || !queueText) return;
-    if (messageQueue.length > 0) {
-      queueBanner.style.display = 'flex';
-      queueText.textContent = `${messageQueue.length} mensagem${messageQueue.length > 1 ? 's' : ''} na fila (será enviada automaticamente a seguir)`;
-    } else {
-      queueBanner.style.display = 'none';
-    }
-  }
+  let cachedMcpData = null;
 
-  function setGeneratingState(generating) {
-    isGenerating = generating;
-    generationStartedAt = generating ? Date.now() : 0;
-    if (btnStop) {
-      btnStop.style.display = generating ? 'flex' : 'none';
-    }
-    if (generating) {
-      btnSend.disabled = false;
-      btnSend.title = 'Enviar mensagem para a fila (Enter)';
-    } else {
-      btnSend.disabled = false;
-      btnSend.classList.remove('btn-stop');
-      btnSend.innerHTML = '<span>Enviar</span><span class="send-icon">➔</span>';
-      btnSend.title = 'Enviar mensagem (Enter)';
-      currentAbortController = null;
-    }
-  }
+  // Tokens count elements
+  const tokEls = {
+    ctx: document.getElementById('tok-read-ctx'),
+    msg: document.getElementById('tok-read-msg'),
+    last: document.getElementById('tok-write-last'),
+    session: document.getElementById('tok-write-session'),
+    ctxPct: document.getElementById('tok-ctx'),
+    speed: document.getElementById('tok-speed'),
+    cache: document.getElementById('tok-cache'),
+  };
 
-  if (btnStop) {
-    btnStop.addEventListener('click', () => {
-      if (currentAbortController) {
-        currentAbortController.abort();
-        currentAbortController = null;
-      }
-      setGeneratingState(false);
-    });
+  const nf = new Intl.NumberFormat('pt-PT');
+
+  function porNumero(el, valor) {
+    if (!el) return;
+    el.textContent = nf.format(Math.max(0, Math.round(valor || 0)));
   }
 
   // ── i18n Internationalization (EN / PT-BR) ──────────────────────────
@@ -107,6 +89,9 @@ document.addEventListener('DOMContentLoaded', () => {
       hints: "Use <strong>/btw &lt;nota&gt;</strong> para interromper/guiar raciocínio • Troque o modelo no menu superior sem perder o histórico",
       mcp_modal_title: "🔌 Gerenciador de Ferramentas MCP",
       mcp_modal_desc: "Selecione quais servidores MCP deseja ativar. No <strong>Modo Turbo</strong>, todos os MCPs são desativados para reduzir o tamanho do prompt e acelerar a inferência.",
+      memory_btn: "Memória",
+      memory_btn_title: "Visualizar Memória L1/L2/L3 e Mermaid Task Canvas",
+      memory_modal_title: "🧠 Memória do Agente (TencentDB Architecture)",
       mcp_btn_turbo: "⚡ Modo Turbo (Desligar Todos)",
       mcp_btn_all: "🔌 Selecionar Todos",
       mcp_btn_save: "Salvar e Aplicar",
@@ -128,7 +113,97 @@ document.addEventListener('DOMContentLoaded', () => {
       save_success: "✅ Configuração salva!",
       saving: "Salvando...",
       lang_flag: "🇧🇷",
-      lang_name: "PT"
+      lang_name: "PT",
+
+      welcome_title: "⚡ Apex Harness Web Interface",
+      welcome_desc: "Harness local autônomo conectado ao servidor de inferência. Suporta <strong>/btw</strong> para interrupção de raciocínio e <strong>troca dinamica de modelo mid-task</strong>.",
+      empty_session_desc: "Sessão vazia. Digite sua mensagem ou comando abaixo para começar.",
+      tag_btw: "💡 Interrupção /btw",
+      tag_hotswap: "🔄 Model Hot-Swap",
+      tag_traces: "🧠 Reasoning Traces",
+      tag_memory: "💾 Session Memory",
+      change_folder_title: "Alterar pasta de trabalho",
+      project_path_title: "Clique para alterar a pasta de trabalho",
+      loading_folder: "Carregando pasta...",
+      model_status_badge_title: "Status do Modelo",
+      context_status_badge_title: "Uso do Context Window",
+      npu_btn_title: "Ativar aceleração heterogênea por hardware na NPU AMD XDNA2 (Critic e Subagentes)",
+      switch_language: "Mudar Idioma / Switch Language",
+      attach_image_title: "Anexar imagem (requer modelo com visão)",
+      attach_file_title: "Anexar ficheiro (código, PDF, CSV, JSON, TXT…) — o conteúdo é injetado no prompt",
+      tok_read_group_title: "O que o modelo lê: contexto da conversa + a mensagem que estás a escrever",
+      tok_read_ctx_title: "Tokens do contexto (o último prompt enviado ao modelo)",
+      tok_read_msg_title: "Tokens da mensagem que estás a escrever agora",
+      tok_write_group_title: "O que o modelo escreveu",
+      tok_write_last_title: "Tokens gerados na última resposta",
+      tok_write_session_title: "Tokens gerados nesta sessão",
+      tok_ctx_title: "Uso da janela de contexto do modelo",
+      tok_speed_title: "Velocidade medida pelo próprio servidor de inferência",
+      tok_cache_title: "Parte do prompt servida do KV cache — é isto que torna o segundo turno muito mais rápido",
+      queue_text_default: "1 mensagem na fila (será enviada a seguir)",
+      queue_text_tpl: "{count} mensagem{s} na fila (será enviada automaticamente a seguir)",
+      send_btn_normal: "Enviar mensagem (Enter)",
+      send_btn_queue: "Enviar mensagem para a fila (Enter)",
+      role_user: "👤 Você",
+      role_user_btw: "💡 Você (/btw Nota Lateral)",
+      think_title: "🧠 Pensamento e Raciocínio (Trace)",
+      thought_for: "🧠 Pensou por {time}s",
+      turn_status: "↻ volta {turn}/{max} — a trabalhar…",
+      tool_running: "🔧 a executar: {name}",
+      tool_done: "✓ concluído: {name}",
+      server_err: "⚠️ Erro do servidor: {err}",
+      conn_err: "⚠️ Erro na conexão: {err}",
+      user_stopped: "⏹ Geração interrompida pelo utilizador.",
+      npu_active_text: "⚡ NPU Ativa ({model})",
+      npu_off_text: "⚡ NPU Offload: Desligada",
+      npu_active_title: "NPU AMD XDNA2 acelerando hardware na porta 8090. Clique para desativar e liberar RAM.",
+      npu_off_title: "Clique para ativar aceleração heterogênea na NPU AMD XDNA2 (Critic & Subagentes)",
+      npu_disabling: "Desativando NPU...",
+      npu_enabling: "Ativando NPU na porta 8090...",
+      npu_notif_on: "⚡ <strong>NPU AMD XDNA2 Ativada!</strong> Tarefas de Crítica e Triagem agora rodam com zero impacto na Radeon 890M.",
+      npu_notif_off: "💤 <strong>NPU Desativada.</strong> Memória RAM 100% liberada.",
+      npu_err: "Erro na NPU: ",
+      npu_toggle_err: "Erro ao alternar NPU: ",
+      active_badge: "Ativo",
+      tag_vision: "visão",
+      prompt_new_folder: "Digite o caminho da nova pasta de trabalho:",
+      folder_changed: "📁 Pasta de trabalho alterada para: <strong>{dir}</strong>",
+      invalid_folder: "Pasta inválida",
+      model_loading_notif: "⏳ Solicitando carregamento do modelo: <strong>{model}</strong>...",
+      model_changed_notif: "🔄 Modelo ativo alterado para: <strong>{model}</strong>",
+      model_load_fail: "Falha ao carregar modelo",
+      model_switch_err: "Erro ao trocar modelo: ",
+      effort_notif: "🧠 Raciocínio (effort) ajustado para: <strong>{effort}</strong>",
+      effort_err: "Erro ao ajustar effort: ",
+      session_prefix: "Sessão",
+      rename_session: "Renomear conversa",
+      delete_session: "Apagar conversa",
+      confirm_new_session_generating: "Uma resposta está a ser gerada. Deseja iniciar uma nova conversa mesmo assim?",
+      confirm_delete_session: "Deseja apagar esta sessão permanentemente do disco e da memória?",
+      err_create_session: "Erro ao criar nova sessão: ",
+      err_delete_session: "Erro ao apagar sessão: ",
+      btn_remove: "Remover",
+      file_header: "Ficheiro",
+      file_truncated: "Truncado a 500 KB — ficheiro original: ",
+      file_label: "ficheiro(s)",
+      image_label: "[imagem]",
+      btw_alert: "Digite uma nota para o comando /btw",
+      rename_alert: "Digite um novo nome: /rename <nome>",
+      renamed_notif: "✏️ Conversa renomeada para: <strong>{title}</strong>",
+      vision_attach_title: "Anexar imagem (ou colar com Ctrl+V, ou arrastar para aqui)",
+      vision_unsupported_title: "Modelo texto apenas — sem suporte a imagens",
+      mon_generating: "Gerando",
+      mon_loading: "Carregando…",
+      mon_idle: "Idle",
+      mon_offline: "Offline",
+      model_loaded_100: "Modelo: 100% Carregado",
+      model_loading_text: "Modelo: Carregando...",
+      model_offline_text: "Modelo: Não Carregado (0%)",
+      ctx_bar_text: "contexto {pct}% de {max}",
+      ctx_cached_text: "♻ {pct}% do prompt em cache",
+      ctx_nocache_text: "♻ sem cache",
+      no_sessions_found: "Nenhuma sessão salva no banco ou disco (~/.apex_sessions/sessions/).",
+      err_loading_sessions: "Erro ao carregar sessões."
     },
     en: {
       app_title: "Apex Harness — Web UI & Model Switcher",
@@ -174,6 +249,9 @@ document.addEventListener('DOMContentLoaded', () => {
       hints: "Use <strong>/btw &lt;note&gt;</strong> to steer reasoning • Switch models from top header without losing history",
       mcp_modal_title: "🔌 MCP Tools Manager",
       mcp_modal_desc: "Select which MCP servers to activate. In <strong>Turbo Mode</strong>, all MCPs are disabled to reduce prompt size and speed up inference.",
+      memory_btn: "Memory",
+      memory_btn_title: "View L1/L2/L3 Memory and Mermaid Task Canvas",
+      memory_modal_title: "🧠 Agent Memory (TencentDB Architecture)",
       mcp_btn_turbo: "⚡ Turbo Mode (Disable All)",
       mcp_btn_all: "🔌 Select All",
       mcp_btn_save: "Save & Apply",
@@ -195,15 +273,217 @@ document.addEventListener('DOMContentLoaded', () => {
       save_success: "✅ Settings saved!",
       saving: "Saving...",
       lang_flag: "🇺🇸",
-      lang_name: "EN"
+      lang_name: "EN",
+
+      welcome_title: "⚡ Apex Harness Web Interface",
+      welcome_desc: "Autonomous local harness connected to the inference server. Supports <strong>/btw</strong> steering and <strong>dynamic mid-task model hot-swap</strong>.",
+      empty_session_desc: "Empty session. Type your message or command below to start.",
+      tag_btw: "💡 /btw Steering",
+      tag_hotswap: "🔄 Model Hot-Swap",
+      tag_traces: "🧠 Reasoning Traces",
+      tag_memory: "💾 Session Memory",
+      change_folder_title: "Change workspace folder",
+      project_path_title: "Click to change workspace folder",
+      loading_folder: "Loading folder...",
+      model_status_badge_title: "Model Status",
+      context_status_badge_title: "Context Window Usage",
+      npu_btn_title: "Enable heterogeneous hardware acceleration on AMD XDNA2 NPU (Critic and Subagents)",
+      switch_language: "Switch Language / Mudar Idioma",
+      attach_image_title: "Attach image (requires vision model)",
+      attach_file_title: "Attach file (code, PDF, CSV, JSON, TXT…) — content is injected into prompt",
+      tok_read_group_title: "What the model reads: conversation context + the message being written",
+      tok_read_ctx_title: "Context tokens (last prompt sent to model)",
+      tok_read_msg_title: "Tokens of message currently being typed",
+      tok_write_group_title: "What the model generated",
+      tok_write_last_title: "Tokens generated in last response",
+      tok_write_session_title: "Tokens generated in this session",
+      tok_ctx_title: "Model context window usage",
+      tok_speed_title: "Speed measured by inference server",
+      tok_cache_title: "Part of prompt served from KV cache — makes subsequent turns much faster",
+      queue_text_default: "1 message in queue (will be sent next)",
+      queue_text_tpl: "{count} message{s} in queue (will be sent automatically next)",
+      send_btn_normal: "Send message (Enter)",
+      send_btn_queue: "Queue message (Enter)",
+      role_user: "👤 You",
+      role_user_btw: "💡 You (/btw Side Note)",
+      think_title: "🧠 Thinking & Reasoning (Trace)",
+      thought_for: "🧠 Thought for {time}s",
+      turn_status: "↻ turn {turn}/{max} — working…",
+      tool_running: "🔧 running: {name}",
+      tool_done: "✓ completed: {name}",
+      server_err: "⚠️ Server error: {err}",
+      conn_err: "⚠️ Connection error: {err}",
+      user_stopped: "⏹ Generation stopped by user.",
+      npu_active_text: "⚡ NPU Active ({model})",
+      npu_off_text: "⚡ NPU Offload: Off",
+      npu_active_title: "AMD XDNA2 NPU hardware acceleration on port 8090. Click to disable and free RAM.",
+      npu_off_title: "Click to activate heterogeneous acceleration on AMD XDNA2 NPU (Critic & Subagents)",
+      npu_disabling: "Disabling NPU...",
+      npu_enabling: "Enabling NPU on port 8090...",
+      npu_notif_on: "⚡ <strong>AMD XDNA2 NPU Activated!</strong> Critic and Triage tasks now run with zero impact on Radeon 890M.",
+      npu_notif_off: "💤 <strong>NPU Deactivated.</strong> 100% RAM freed.",
+      npu_err: "NPU Error: ",
+      npu_toggle_err: "Error toggling NPU: ",
+      active_badge: "Active",
+      tag_vision: "vision",
+      prompt_new_folder: "Enter the new workspace folder path:",
+      folder_changed: "📁 Workspace folder changed to: <strong>{dir}</strong>",
+      invalid_folder: "Invalid folder",
+      model_loading_notif: "⏳ Requesting model load: <strong>{model}</strong>...",
+      model_changed_notif: "🔄 Active model changed to: <strong>{model}</strong>",
+      model_load_fail: "Failed to load model",
+      model_switch_err: "Error switching model: ",
+      effort_notif: "🧠 Reasoning effort set to: <strong>{effort}</strong>",
+      effort_err: "Error adjusting effort: ",
+      session_prefix: "Session",
+      rename_session: "Rename conversation",
+      delete_session: "Delete conversation",
+      confirm_new_session_generating: "A response is currently being generated. Do you want to start a new chat anyway?",
+      confirm_delete_session: "Permanently delete this session from disk and memory?",
+      err_create_session: "Error creating new session: ",
+      err_delete_session: "Error deleting session: ",
+      btn_remove: "Remove",
+      file_header: "File",
+      file_truncated: "Truncated to 500 KB — original file: ",
+      file_label: "file(s)",
+      image_label: "[image]",
+      btw_alert: "Provide a note for the /btw command",
+      rename_alert: "Provide a new name: /rename <title>",
+      renamed_notif: "✏️ Conversation renamed to: <strong>{title}</strong>",
+      vision_attach_title: "Attach image (or paste with Ctrl+V, or drag here)",
+      vision_unsupported_title: "Text-only model — no image support",
+      mon_generating: "Generating",
+      mon_loading: "Loading…",
+      mon_idle: "Idle",
+      mon_offline: "Offline",
+      model_loaded_100: "Model: 100% Loaded",
+      model_loading_text: "Model: Loading...",
+      model_offline_text: "Model: Offline (0%)",
+      ctx_bar_text: "context {pct}% of {max}",
+      ctx_cached_text: "♻ {pct}% prompt cached",
+      ctx_nocache_text: "♻ no cache",
+      no_sessions_found: "No sessions saved to database or disk.",
+      err_loading_sessions: "Error loading sessions."
     }
   };
 
   let currentLang = localStorage.getItem('apex_lang') || 'pt';
 
+  function t(key, params = {}) {
+    const dict = translations[currentLang] || translations.pt;
+    let str = dict[key] !== undefined ? dict[key] : (translations.pt[key] !== undefined ? translations.pt[key] : key);
+    if (typeof str === 'string') {
+      Object.keys(params).forEach(k => {
+        str = str.replace(new RegExp(`\\{${k}\\}`, 'g'), params[k]);
+      });
+    }
+    return str;
+  }
+
+  // ── Auto-scroll manager ─────────────────────────────────────────────
+  let userScrolledUp = false;
+
+  if (chatStream) {
+    chatStream.addEventListener('scroll', () => {
+      const distFromBottom = chatStream.scrollHeight - (chatStream.scrollTop + chatStream.clientHeight);
+      userScrolledUp = distFromBottom > 80;
+    });
+  }
+
+  function scrollToBottom(force = false) {
+    if (!chatStream) return;
+    if (force) userScrolledUp = false;
+    if (userScrolledUp && !force) return;
+    requestAnimationFrame(() => {
+      chatStream.scrollTop = chatStream.scrollHeight;
+    });
+  }
+
+  let currentSessionId = localStorage.getItem('apex_active_session_id') || '';
+  let isGenerating = false;
+  let currentAbortController = null;
+  let generationStartedAt = 0;  // timestamp ms — para o watchdog detectar estado preso
+  let messageQueue = [];
+
+  function updateQueueBanner() {
+    if (!queueBanner || !queueText) return;
+    if (messageQueue.length > 0) {
+      queueBanner.style.display = 'flex';
+      const count = messageQueue.length;
+      queueText.textContent = t('queue_text_tpl', {
+        count,
+        s: count > 1 ? 's' : ''
+      });
+    } else {
+      queueBanner.style.display = 'none';
+    }
+  }
+
+  function setGeneratingState(generating) {
+    isGenerating = generating;
+    generationStartedAt = generating ? Date.now() : 0;
+    if (btnStop) {
+      btnStop.style.display = generating ? 'flex' : 'none';
+    }
+    if (generating) {
+      btnSend.disabled = false;
+      btnSend.title = t('send_btn_queue');
+    } else {
+      btnSend.disabled = false;
+      btnSend.classList.remove('btn-stop');
+      btnSend.innerHTML = `<span>${t('send')}</span><span class="send-icon">➔</span>`;
+      btnSend.title = t('send_btn_normal');
+      currentAbortController = null;
+    }
+  }
+
+  if (btnStop) {
+    btnStop.addEventListener('click', () => {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+      setGeneratingState(false);
+    });
+  }
+
+  function updateWelcomeCardLang() {
+    if (!chatStream) return;
+    const card = chatStream.querySelector('.welcome-card');
+    if (card) {
+      const isInitial = !chatStream.querySelector('.message');
+      const h2 = card.querySelector('h2');
+      const p = card.querySelector('p');
+      const tags = card.querySelectorAll('.feature-tags .tag');
+      if (h2) h2.innerHTML = t('welcome_title');
+      if (p) p.innerHTML = isInitial ? t('welcome_desc') : t('empty_session_desc');
+      if (tags.length >= 4) {
+        tags[0].innerHTML = t('tag_btw');
+        tags[1].innerHTML = t('tag_hotswap');
+        tags[2].innerHTML = t('tag_traces');
+        tags[3].innerHTML = t('tag_memory');
+      }
+    }
+  }
+
+  function updateSessionsListLang() {
+    if (!sessionsList) return;
+    document.querySelectorAll('.btn-rename-session').forEach(btn => {
+      btn.title = t('rename_session');
+    });
+    document.querySelectorAll('.btn-delete-session').forEach(btn => {
+      btn.title = t('delete_session');
+    });
+    const emptyEl = sessionsList.querySelector('.empty-sessions');
+    if (emptyEl) {
+      emptyEl.textContent = t('no_sessions_found');
+    }
+  }
+
   function applyLanguage(lang) {
     currentLang = lang;
     localStorage.setItem('apex_lang', lang);
+    document.documentElement.lang = lang === 'en' ? 'en' : 'pt-BR';
     const dict = translations[lang] || translations.pt;
 
     document.querySelectorAll('[data-i18n]').forEach(el => {
@@ -232,10 +512,40 @@ document.addEventListener('DOMContentLoaded', () => {
     if (langFlag) langFlag.textContent = dict.lang_flag;
     if (langText) langText.textContent = dict.lang_name;
 
+    updateWelcomeCardLang();
+    setGeneratingState(isGenerating);
+    updateQueueBanner();
+
     if (cachedMcpData) {
       renderMcpSelect(cachedMcpData);
       renderMcpChecklist(cachedMcpData);
     }
+    if (lastStatusData) {
+      atualizarBarraTokens(lastStatusData);
+      atualizarMonitor(lastStatusData);
+    }
+    if (lastModelsData) {
+      renderModelsSelect(lastModelsData);
+    }
+    if (lastNpuData) {
+      renderNpuStatus(lastNpuData);
+    }
+    carregarVisao();
+    updateSessionsListLang();
+
+    // Atualizar mensagens e blocos já renderizados no ecrã
+    document.querySelectorAll('.message.user:not(.btw-note) .message-role').forEach(el => {
+      el.innerHTML = t('role_user');
+    });
+    document.querySelectorAll('.message.user.btw-note .message-role').forEach(el => {
+      el.innerHTML = t('role_user_btw');
+    });
+    document.querySelectorAll('.think-block summary').forEach(el => {
+      el.textContent = t('think_title');
+    });
+    document.querySelectorAll('.file-badge-remove').forEach(el => {
+      el.title = t('btn_remove');
+    });
   }
 
   const btnLangToggle = document.getElementById('btn-lang-toggle');
@@ -246,16 +556,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Initialize Web UI
-  applyLanguage(currentLang);
-  loadProject();
-  loadModels();
-  loadMcp();
-  loadSessions();
-  loadStatus();
-  loadNpuStatus();
-  setInterval(loadStatus, 4000);
-  setInterval(loadNpuStatus, 5000);
+  // (Web UI initialization moved to end of DOMContentLoaded to guarantee all elements & handlers are ready)
 
   // Watchdog: se isGenerating ficou preso (sem stream ativo há > 90 s), resetar.
   // Isto acontece quando o servidor reinicia, a ligação cai silenciosamente, ou
@@ -303,7 +604,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function _nFmt(v) {
     const n = Math.max(0, Math.round(parseFloat(v) || 0));
-    return n.toLocaleString('pt-PT');
+    return n.toLocaleString(currentLang === 'en' ? 'en-US' : 'pt-PT');
   }
 
   function atualizarMonitor(data) {
@@ -333,7 +634,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const isGen  = status === 'ready' && decodeTps > 0.3;
       const isIdle = status === 'ready' && decodeTps <= 0.3;
       dot.className = 'mon-dot-state ' + (isGen ? 'gen' : isIdle ? 'idle' : status === 'loading' ? 'loading' : 'offline');
-      stLbl.textContent = isGen ? 'Gerando' : isIdle ? 'Idle' : status === 'loading' ? 'Carregando…' : 'Offline';
+      stLbl.textContent = isGen ? t('mon_generating') : isIdle ? t('mon_idle') : status === 'loading' ? t('mon_loading') : t('mon_offline');
       if (elLbl) elLbl.textContent = isGen ? `${elapsedSec}s` : '';
       if (pulse)  pulse.className = 'monitor-pulse' + (isGen ? ' active' : '');
     }
@@ -387,25 +688,27 @@ document.addEventListener('DOMContentLoaded', () => {
     if (stEl) stEl.textContent = _nFmt(sessRead + sessWrite);
   }
 
+  let lastStatusData = null;
+
   async function loadStatus() {
     try {
       const res = await fetch('/api/status');
       const data = await res.json();
+      lastStatusData = data;
       const dot = document.getElementById('model-status-dot');
       const modelText = document.getElementById('model-load-text');
       const ctxText = document.getElementById('context-load-text');
 
       if (dot && modelText && data.status !== undefined) {
-        const isEn = currentLang === 'en';
         if (data.status === 'ready' && data.model_loaded_pct === 100) {
           dot.className = 'dot green';
-          modelText.textContent = isEn ? 'Model: 100% Loaded' : 'Modelo: 100% Carregado';
+          modelText.textContent = t('model_loaded_100');
         } else if (data.status === 'loading') {
           dot.className = 'dot yellow';
-          modelText.textContent = isEn ? 'Model: Loading...' : 'Modelo: Carregando...';
+          modelText.textContent = t('model_loading_text');
         } else {
           dot.className = 'dot red';
-          modelText.textContent = isEn ? 'Model: Offline (0%)' : 'Modelo: Não Carregado (0%)';
+          modelText.textContent = t('model_offline_text');
         }
       }
       if (ctxText && data.context_pct !== undefined) {
@@ -433,7 +736,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   btnChangeFolder.addEventListener('click', async () => {
     const current = projectPath.title || '';
-    const newDir = prompt('Digite o caminho da nova pasta de trabalho:', current);
+    const newDir = prompt(t('prompt_new_folder'), current);
     if (!newDir || newDir.trim() === '' || newDir.trim() === current) return;
 
     try {
@@ -446,9 +749,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (data.status === 'ok') {
         projectPath.textContent = data.folder_name || data.project_dir;
         projectPath.title = data.project_dir;
-        appendSystemNotification(`📁 Pasta de trabalho alterada para: <strong>${data.project_dir}</strong>`);
+        appendSystemNotification(t('folder_changed', { dir: data.project_dir }));
       } else {
-        alert('Erro: ' + (data.message || 'Pasta inválida'));
+        alert('Erro: ' + (data.message || t('invalid_folder')));
       }
     } catch (err) {
       alert('Erro ao alterar pasta: ' + err.message);
@@ -456,47 +759,52 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Load Models List & Active Model
+  let lastModelsData = null;
+
+  function renderModelsSelect(data) {
+    if (!modelSelect || !data) return;
+    modelSelect.innerHTML = '';
+
+    if (data.available && data.available.length > 0) {
+      const meta = {};
+      (data.models || []).forEach(m => { if (m && m.key) meta[m.key] = m; });
+
+      data.available.forEach(m => {
+        const info = meta[m] || {};
+        const opt = document.createElement('option');
+        opt.value = m;
+
+        let label = info.label || m.split('/').pop() || m;
+        const tags = [];
+        if (info.size_gb) tags.push(`${Number(info.size_gb).toFixed(1)} GB`);
+        if (info.ctx) tags.push(`ctx ${Math.round(info.ctx / 1024)}k`);
+        if (info.vision) tags.push(t('tag_vision'));
+        if (info.tools) tags.push('tools');
+        if (tags.length) label += `  · ${tags.join(' · ')}`;
+
+        opt.textContent = m === data.active ? `⚡ ${label} (${t('active_badge')})` : label;
+        if (m === data.active) opt.selected = true;
+        modelSelect.appendChild(opt);
+      });
+    } else if (data.active) {
+      const opt = document.createElement('option');
+      opt.value = data.active;
+      opt.textContent = `⚡ ${data.active} (${t('active_badge')})`;
+      opt.selected = true;
+      modelSelect.appendChild(opt);
+    }
+
+    if (data.reasoning_effort) {
+      effortSelect.value = data.reasoning_effort;
+    }
+  }
+
   async function loadModels() {
     try {
       const res = await fetch('/api/models');
       const data = await res.json();
-      modelSelect.innerHTML = '';
-
-      if (data.available && data.available.length > 0) {
-        // O servidor devolve `models` com metadados (label, tamanho, contexto,
-        // visao, tool-use) e `available` com as chaves. Usamos os metadados para
-        // etiquetas legiveis; antes mostrava-se a chave crua, ilegivel.
-        const meta = {};
-        (data.models || []).forEach(m => { if (m && m.key) meta[m.key] = m; });
-
-        data.available.forEach(m => {
-          const info = meta[m] || {};
-          const opt = document.createElement('option');
-          opt.value = m;
-
-          let label = info.label || m.split('/').pop() || m;
-          const tags = [];
-          if (info.size_gb) tags.push(`${Number(info.size_gb).toFixed(1)} GB`);
-          if (info.ctx) tags.push(`ctx ${Math.round(info.ctx / 1024)}k`);
-          if (info.vision) tags.push('visão');
-          if (info.tools) tags.push('tools');
-          if (tags.length) label += `  · ${tags.join(' · ')}`;
-
-          opt.textContent = m === data.active ? `⚡ ${label} (Ativo)` : label;
-          if (m === data.active) opt.selected = true;
-          modelSelect.appendChild(opt);
-        });
-      } else if (data.active) {
-        const opt = document.createElement('option');
-        opt.value = data.active;
-        opt.textContent = `⚡ ${data.active} (Ativo)`;
-        opt.selected = true;
-        modelSelect.appendChild(opt);
-      }
-
-      if (data.reasoning_effort) {
-        effortSelect.value = data.reasoning_effort;
-      }
+      lastModelsData = data;
+      renderModelsSelect(data);
     } catch (err) {
       console.error('Erro ao carregar modelos:', err);
     }
@@ -510,9 +818,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const dot = document.getElementById('model-status-dot');
     const modelText = document.getElementById('model-load-text');
     if (dot) dot.className = 'dot yellow';
-    if (modelText) modelText.textContent = 'Modelo: Carregando...';
+    if (modelText) modelText.textContent = t('model_loading_text');
 
-    appendSystemNotification(`⏳ Solicitando carregamento do modelo: <strong>${selectedModel}</strong>...`);
+    appendSystemNotification(t('model_loading_notif', { model: selectedModel }));
 
     try {
       const res = await fetch('/api/model', {
@@ -522,18 +830,18 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       const data = await res.json();
       if (data.status === 'ok') {
-        appendSystemNotification(`🔄 Modelo ativo alterado para: <strong>${data.active || selectedModel}</strong>`);
+        appendSystemNotification(t('model_changed_notif', { model: data.active || selectedModel }));
         loadModels();
         loadStatus();
       } else {
-        appendSystemNotification(`⚠️ ${data.message || 'Falha ao carregar modelo'}`);
-        alert(data.message || 'Falha ao carregar modelo');
+        appendSystemNotification(`⚠️ ${data.message || t('model_load_fail')}`);
+        alert(data.message || t('model_load_fail'));
         loadModels();
         loadStatus();
       }
     } catch (err) {
-      appendSystemNotification(`⚠️ Erro de comunicação: ${err.message}`);
-      alert('Erro ao trocar modelo: ' + err.message);
+      appendSystemNotification(`⚠️ Erro: ${err.message}`);
+      alert(t('model_switch_err') + err.message);
       loadStatus();
     }
   });
@@ -549,10 +857,10 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       const data = await res.json();
       if (data.status === 'ok') {
-        appendSystemNotification(`🧠 Raciocínio (effort) ajustado para: <strong>${effort.toUpperCase()}</strong>`);
+        appendSystemNotification(t('effort_notif', { effort: effort.toUpperCase() }));
       }
     } catch (err) {
-      alert('Erro ao ajustar effort: ' + err.message);
+      alert(t('effort_err') + err.message);
     }
   });
 
@@ -560,7 +868,7 @@ document.addEventListener('DOMContentLoaded', () => {
   btnClear.addEventListener('click', () => startNewSession(true));
   btnNewChat.addEventListener('click', () => startNewSession(true));
 
-  let cachedMcpData = null;
+  // cachedMcpData declared at top of DOMContentLoaded
 
   async function loadMcp() {
     if (!mcpSelect) return;
@@ -749,6 +1057,175 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // ── Modal de Memória Hierárquica e Task Canvas ────────────────────
+  const btnMemoryModal = document.getElementById('btn-memory-modal');
+  const btnCloseMemoryModal = document.getElementById('btn-close-memory-modal');
+  const memoryModal = document.getElementById('memory-modal');
+  const memCanvasRaw = document.getElementById('mem-canvas-raw');
+  const memAtomsList = document.getElementById('mem-atoms-list');
+  const memPersonaText = document.getElementById('mem-persona-text');
+  const memStatsText = document.getElementById('mem-stats-text');
+  const btnMemRefresh = document.getElementById('btn-mem-refresh');
+  const btnMemAddFact = document.getElementById('btn-mem-add-fact');
+  const memNewFactInput = document.getElementById('mem-new-fact-input');
+  const memNewFactCat = document.getElementById('mem-new-fact-cat');
+  const btnMemSearch = document.getElementById('btn-mem-search');
+  const memSearchInput = document.getElementById('mem-search-input');
+  const memSearchResults = document.getElementById('mem-search-results');
+
+  // Sub-tabs switching
+  const memTabBtns = document.querySelectorAll('.mem-tab-btn');
+  memTabBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      memTabBtns.forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.mem-tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const tabId = 'mem-tab-' + btn.getAttribute('data-tab');
+      const pane = document.getElementById(tabId);
+      if (pane) pane.classList.add('active');
+    });
+  });
+
+  async function loadMemoryData() {
+    if (memStatsText) memStatsText.textContent = 'Carregando dados de memória...';
+    try {
+      const res = await fetch('/api/memory');
+      const data = await res.json();
+      if (!data.enabled) {
+        if (memStatsText) memStatsText.textContent = 'Memória desativada.';
+        return;
+      }
+
+      // 1. Canvas
+      if (memCanvasRaw) {
+        memCanvasRaw.textContent = data.canvas || 'Nenhum canvas gerado ainda para esta sessão.';
+      }
+
+      // 2. Persona
+      if (memPersonaText) {
+        memPersonaText.textContent = data.persona || '(Persona ainda não consolidada)';
+      }
+
+      // 3. Fatos L1
+      if (memAtomsList) {
+        memAtomsList.innerHTML = '';
+        const atoms = data.recent_atoms || [];
+        if (atoms.length === 0) {
+          memAtomsList.innerHTML = '<div style="color:var(--text-muted); font-size:0.84rem;">Nenhum fato gravado ainda.</div>';
+        } else {
+          atoms.forEach(atom => {
+            const card = document.createElement('div');
+            card.className = 'mem-atom-card';
+            card.innerHTML = `
+              <div class="mem-atom-header">
+                <span class="mem-atom-cat">${escapeHtml(atom.category || 'general')}</span>
+                <span style="color:var(--text-muted); font-size:0.72rem;">${atom.created_at || ''} (${escapeHtml(atom.source || '')})</span>
+              </div>
+              <div class="mem-atom-fact">${escapeHtml(atom.fact || '')}</div>
+            `;
+            memAtomsList.appendChild(card);
+          });
+        }
+      }
+
+      if (memStatsText) {
+        memStatsText.textContent = `Memória L1: ${data.atoms_count || 0} fatos atômicos consolidados em SQLite FTS5`;
+      }
+    } catch (e) {
+      if (memStatsText) memStatsText.textContent = 'Erro ao ler memória: ' + e.message;
+    }
+  }
+
+  if (btnMemoryModal && memoryModal) {
+    btnMemoryModal.addEventListener('click', () => {
+      memoryModal.style.display = 'flex';
+      loadMemoryData();
+    });
+  }
+
+  if (btnCloseMemoryModal && memoryModal) {
+    btnCloseMemoryModal.addEventListener('click', () => {
+      memoryModal.style.display = 'none';
+    });
+  }
+
+  if (memoryModal) {
+    memoryModal.addEventListener('click', (e) => {
+      if (e.target === memoryModal) {
+        memoryModal.style.display = 'none';
+      }
+    });
+  }
+
+  if (btnMemRefresh) {
+    btnMemRefresh.addEventListener('click', () => {
+      loadMemoryData();
+    });
+  }
+
+  if (btnMemAddFact && memNewFactInput) {
+    btnMemAddFact.addEventListener('click', async () => {
+      const fact = memNewFactInput.value.trim();
+      const cat = memNewFactCat ? memNewFactCat.value : 'general';
+      if (!fact) return;
+      btnMemAddFact.disabled = true;
+      try {
+        const res = await fetch('/api/memory', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'remember', fact, category: cat })
+        });
+        const d = await res.json();
+        if (d.status === 'ok') {
+          memNewFactInput.value = '';
+          await loadMemoryData();
+        } else {
+          alert('Erro ao salvar fato: ' + (d.error || 'Desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao comunicar: ' + err.message);
+      } finally {
+        btnMemAddFact.disabled = false;
+      }
+    });
+  }
+
+  if (btnMemSearch && memSearchInput && memSearchResults) {
+    btnMemSearch.addEventListener('click', async () => {
+      const query = memSearchInput.value.trim();
+      if (!query) return;
+      memSearchResults.innerHTML = '<div style="color:var(--text-muted); font-size:0.84rem;">Buscando por BM25 + Vetores...</div>';
+      try {
+        const res = await fetch('/api/memory', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'search', query, top_k: 8 })
+        });
+        const d = await res.json();
+        const results = d.results || [];
+        memSearchResults.innerHTML = '';
+        if (results.length === 0) {
+          memSearchResults.innerHTML = '<div style="color:var(--text-muted); font-size:0.84rem;">Nenhum resultado encontrado.</div>';
+          return;
+        }
+        results.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'mem-atom-card';
+          card.innerHTML = `
+            <div class="mem-atom-header">
+              <span class="mem-atom-cat">${escapeHtml(item.category || 'general')}</span>
+              <span style="color:var(--accent-cyan); font-size:0.75rem;">Score RRF: ${(item.score || 0).toFixed(4)}</span>
+            </div>
+            <div class="mem-atom-fact">${escapeHtml(item.fact || '')}</div>
+          `;
+          memSearchResults.appendChild(card);
+        });
+      } catch (err) {
+        memSearchResults.innerHTML = '<div style="color:#ef4444; font-size:0.84rem;">Erro na busca: ' + err.message + '</div>';
+      }
+    });
+  }
+
   if (mcpSelect) {
     mcpSelect.addEventListener('change', async () => {
       const val = mcpSelect.value;
@@ -778,34 +1255,38 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // ── NPU Accelerator Toggle & Polling ─────────────────────────
-  const btnNpuToggle = document.getElementById('btn-npu-toggle');
-  const npuStatusDot = document.getElementById('npu-status-dot');
-  const npuBtnText = document.getElementById('npu-btn-text');
-  let npuIsActive = false;
+  // (NPU elements declared at top of DOMContentLoaded)
+
+  let lastNpuData = null;
+
+  function renderNpuStatus(data) {
+    if (!btnNpuToggle || !data) return;
+    npuIsActive = Boolean(data.active);
+
+    if (npuStatusDot && npuBtnText) {
+      if (npuIsActive) {
+        btnNpuToggle.classList.add('active');
+        btnNpuToggle.classList.remove('loading');
+        npuStatusDot.className = 'dot green';
+        npuBtnText.textContent = t('npu_active_text', { model: data.loaded_model || 'qwen3-0.6b-FLM' });
+        btnNpuToggle.title = t('npu_active_title');
+      } else {
+        btnNpuToggle.classList.remove('active');
+        btnNpuToggle.classList.remove('loading');
+        npuStatusDot.className = 'dot';
+        npuBtnText.textContent = t('npu_off_text');
+        btnNpuToggle.title = t('npu_off_title');
+      }
+    }
+  }
 
   async function loadNpuStatus() {
     if (!btnNpuToggle) return;
     try {
       const res = await fetch('/api/npu');
       const data = await res.json();
-      npuIsActive = Boolean(data.active);
-
-      if (npuStatusDot && npuBtnText) {
-        if (data.active) {
-          btnNpuToggle.classList.add('active');
-          btnNpuToggle.classList.remove('loading');
-          npuStatusDot.className = 'dot green';
-          npuBtnText.textContent = `⚡ NPU Ativa (${data.loaded_model || 'qwen3-0.6b-FLM'})`;
-          btnNpuToggle.title = `NPU AMD XDNA2 acelerando hardware na porta 8090. Clique para desativar e liberar RAM.`;
-        } else {
-          btnNpuToggle.classList.remove('active');
-          btnNpuToggle.classList.remove('loading');
-          npuStatusDot.className = 'dot';
-          npuBtnText.textContent = '⚡ NPU Offload: Desligada';
-          btnNpuToggle.title = 'Clique para ativar aceleração heterogênea na NPU AMD XDNA2 (Critic & Subagentes)';
-        }
-      }
+      lastNpuData = data;
+      renderNpuStatus(data);
     } catch (err) {
       console.warn('Erro ao checar status NPU:', err);
     }
@@ -816,7 +1297,7 @@ document.addEventListener('DOMContentLoaded', () => {
       btnNpuToggle.classList.add('loading');
       const targetAction = npuIsActive ? 'stop' : 'start';
       if (npuBtnText) {
-        npuBtnText.textContent = npuIsActive ? 'Desativando NPU...' : 'Ativando NPU na porta 8090...';
+        npuBtnText.textContent = npuIsActive ? t('npu_disabling') : t('npu_enabling');
       }
 
       try {
@@ -827,15 +1308,12 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         const d = await res.json();
         if (d.status === 'ok') {
-          appendSystemNotification(d.active 
-            ? `⚡ <strong>NPU AMD XDNA2 Ativada!</strong> Tarefas de Crítica e Triagem agora rodam com zero impacto na Radeon 890M.`
-            : `💤 <strong>NPU Desativada.</strong> Memória RAM 100% liberada.`
-          );
+          appendSystemNotification(d.active ? t('npu_notif_on') : t('npu_notif_off'));
         } else {
-          alert('Erro na NPU: ' + (d.message || 'Falha ao comunicar com Lemonade'));
+          alert(t('npu_err') + (d.message || 'Falha ao comunicar com Lemonade'));
         }
       } catch (err) {
-        alert('Erro ao alternar NPU: ' + err.message);
+        alert(t('npu_toggle_err') + err.message);
       } finally {
         await loadNpuStatus();
       }
@@ -874,7 +1352,7 @@ document.addEventListener('DOMContentLoaded', () => {
           item.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
           item.dataset.id = s.id;
 
-          const title = s.summary || `Sessão ${s.id.substring(5, 13)}`;
+          const title = s.summary || `${t('session_prefix')} ${s.id.substring(5, 13)}`;
           const dateStr = s.last_active ? formatSessionDate(s.last_active) : (s.started_at ? formatSessionDate(s.started_at) : '');
 
           item.innerHTML = `
@@ -886,8 +1364,8 @@ document.addEventListener('DOMContentLoaded', () => {
               </div>
             </div>
             <div class="session-actions">
-              <button class="btn-rename-session" title="${currentLang === 'en' ? 'Rename conversation' : 'Renomear conversa'}" data-id="${s.id}">✏️</button>
-              <button class="btn-delete-session" title="${currentLang === 'en' ? 'Delete conversation' : 'Apagar conversa'}" data-id="${s.id}">🗑️</button>
+              <button class="btn-rename-session" title="${t('rename_session')}" data-id="${s.id}">✏️</button>
+              <button class="btn-delete-session" title="${t('delete_session')}" data-id="${s.id}">🗑️</button>
             </div>
           `;
 
@@ -969,13 +1447,13 @@ document.addEventListener('DOMContentLoaded', () => {
           selectSession(initialId);
         }
       } else {
-        sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#94a3b8">Nenhuma sessão salva no banco ou disco (~/.apex_sessions/sessions/).</div>';
+        sessionsList.innerHTML = `<div class="empty-sessions" style="font-size:0.8rem; color:#94a3b8">${t('no_sessions_found')}</div>`;
         if (!currentSessionId) {
           startNewSession(false);
         }
       }
     } catch (err) {
-      sessionsList.innerHTML = '<div class="empty-sessions" style="font-size:0.8rem; color:#ef4444">Erro ao carregar sessões.</div>';
+      sessionsList.innerHTML = `<div class="empty-sessions" style="font-size:0.8rem; color:#ef4444">${t('err_loading_sessions')}</div>`;
     }
   }
 
@@ -1008,16 +1486,17 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!messages || messages.length === 0) {
       chatStream.innerHTML = `
         <div class="welcome-card">
-          <h2>⚡ Apex Harness Web Interface</h2>
-          <p>Sessão vazia. Digite sua mensagem ou comando abaixo para começar.</p>
+          <h2 data-i18n="welcome_title">${t('welcome_title')}</h2>
+          <p data-i18n="welcome_desc">${t('empty_session_desc')}</p>
           <div class="feature-tags">
-            <span class="tag">💡 Interrupção /btw</span>
-            <span class="tag">🔄 Model Hot-Swap</span>
-            <span class="tag">🧠 Reasoning Traces</span>
-            <span class="tag">💾 Session Memory</span>
+            <span class="tag" data-i18n="tag_btw">${t('tag_btw')}</span>
+            <span class="tag" data-i18n="tag_hotswap">${t('tag_hotswap')}</span>
+            <span class="tag" data-i18n="tag_traces">${t('tag_traces')}</span>
+            <span class="tag" data-i18n="tag_memory">${t('tag_memory')}</span>
           </div>
         </div>
       `;
+      scrollToBottom(true);
       return;
     }
 
@@ -1031,7 +1510,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    chatStream.scrollTop = chatStream.scrollHeight;
+    scrollToBottom(true);
   }
 
   function appendHistoricalAssistantMessage(fullText) {
@@ -1055,7 +1534,7 @@ document.addEventListener('DOMContentLoaded', () => {
       details.className = 'think-block';
       details.open = false;
       const summary = document.createElement('summary');
-      summary.textContent = '🧠 Pensamento e Raciocínio (Trace)';
+      summary.textContent = t('think_title');
       details.appendChild(summary);
 
       const thinkContent = document.createElement('div');
@@ -1077,7 +1556,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function startNewSession(refreshUI = true) {
     if (isGenerating) {
-      if (!confirm('Uma resposta está a ser gerada. Deseja iniciar uma nova conversa mesmo assim?')) return;
+      if (!confirm(t('confirm_new_session_generating'))) return;
       if (currentAbortController) currentAbortController.abort();
       setGeneratingState(false);
     }
@@ -1092,12 +1571,12 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       userInput.focus();
     } catch (err) {
-      alert('Erro ao criar nova sessão: ' + err.message);
+      alert(t('err_create_session') + err.message);
     }
   }
 
   async function deleteSession(sessionId) {
-    if (!confirm('Deseja apagar esta sessão permanentemente do disco e da memória?')) return;
+    if (!confirm(t('confirm_delete_session'))) return;
     try {
       const res = await fetch('/api/session/delete', {
         method: 'POST',
@@ -1112,7 +1591,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       loadSessions();
     } catch (err) {
-      alert('Erro ao apagar sessão: ' + err.message);
+      alert(t('err_delete_session') + err.message);
     }
   }
 
@@ -1148,10 +1627,10 @@ document.addEventListener('DOMContentLoaded', () => {
         appendUserMessage(note, true);
         loadStatus();
       } else {
-        alert(data.message || 'Erro ao enviar /btw');
+        alert(data.message || t('btw_alert'));
       }
     } catch (err) {
-      alert('Erro ao enviar /btw: ' + err.message);
+      alert(err.message);
     }
   }
 
@@ -1183,27 +1662,7 @@ document.addEventListener('DOMContentLoaded', () => {
   userInput.addEventListener('paste', () => setTimeout(() => { ajustarAlturaCaixa(); agendarContagemMensagem(); }, 0));
   window.addEventListener('resize', ajustarAlturaCaixa);
 
-  // ------------------------------------------------------- contagem de tokens ---
-  // Leitura/escrita, na barra de baixo. Os numeros do modelo vem do `usage` que o
-  // llama-server manda no fim de cada pedido; a contagem do que se esta a
-  // escrever vem do tokenizer real do modelo (/api/tokenize), com debounce para
-  // nao disparar um pedido por tecla.
-  const tokEls = {
-    ctx: document.getElementById('tok-read-ctx'),
-    msg: document.getElementById('tok-read-msg'),
-    last: document.getElementById('tok-write-last'),
-    session: document.getElementById('tok-write-session'),
-    ctxPct: document.getElementById('tok-ctx'),
-    speed: document.getElementById('tok-speed'),
-    cache: document.getElementById('tok-cache'),
-  };
-
-  const nf = new Intl.NumberFormat('pt-PT');
-
-  function porNumero(el, valor) {
-    if (!el) return;
-    el.textContent = nf.format(Math.max(0, Math.round(valor || 0)));
-  }
+  // (Token elements and formatter declared at top of DOMContentLoaded)
 
   let timerMsg = null;
   let pedidoMsg = 0;   // numero de sequencia, para ignorar respostas fora de ordem
@@ -1244,7 +1703,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (tokEls.ctxPct) {
       const pct = d.context_pct != null ? d.context_pct : 0;
-      tokEls.ctxPct.textContent = `contexto ${pct}% de ${nf.format(d.max_context || 0)}`;
+      tokEls.ctxPct.textContent = t('ctx_bar_text', {
+        pct,
+        max: nf.format(d.max_context || 0)
+      });
     }
     if (tokEls.speed) {
       const dec = Number(d.decode_tps || 0);
@@ -1254,8 +1716,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const cached = Number(d.cached_tokens || 0);
       const prompt = Number(d.context_tokens || 0);
       tokEls.cache.textContent = (cached > 0 && prompt > 0)
-        ? `♻ ${Math.round((cached / prompt) * 100)}% do prompt em cache`
-        : '♻ sem cache';
+        ? t('ctx_cached_text', { pct: Math.round((cached / prompt) * 100) })
+        : t('ctx_nocache_text');
     }
   }
 
@@ -1289,8 +1751,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnAttach) {
       btnAttach.disabled = !visionOk;
       btnAttach.title = visionOk
-        ? 'Anexar imagem (ou colar com Ctrl+V, ou arrastar para aqui)'
-        : 'Modelo texto apenas — sem suporte a imagens';
+        ? t('vision_attach_title')
+        : t('vision_unsupported_title');
     }
     // A mensagem no footer é redundante: o botão desativado já comunica isso.
     // Manter sempre oculta para não poluir a interface.
@@ -1316,7 +1778,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const x = document.createElement('button');
       x.type = 'button';
       x.textContent = '×';
-      x.title = 'Remover';
+      x.title = t('btn_remove');
       x.addEventListener('click', () => {
         pendingImages.splice(i, 1);
         renderImagens();
@@ -1439,7 +1901,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <span class="file-badge-icon">📄</span>
         <span class="file-badge-name" title="${f.name}">${f.name}</span>
         <span class="file-badge-size">${kb} KB</span>
-        <button class="file-badge-remove" title="Remover">×</button>
+        <button class="file-badge-remove" title="${t('btn_remove')}">×</button>
       `;
       badge.querySelector('.file-badge-remove').addEventListener('click', () => {
         pendingTextFiles.splice(i, 1);
@@ -1469,8 +1931,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function buildFileBlock(f) {
     const lang = langFor(f.ext);
-    const header = `\n\n--- Ficheiro: ${f.name} ---`;
-    const notice = f.truncated ? `\n[⚠️ Truncado a 500 KB — ficheiro original: ${(f.size/1024).toFixed(0)} KB]` : '';
+    const header = `\n\n--- ${t('file_header')}: ${f.name} ---`;
+    const notice = f.truncated ? `\n[⚠️ ${t('file_truncated')}${(f.size/1024).toFixed(0)} KB]` : '';
     return `${header}${notice}\n\`\`\`${lang}\n${f.text}\n\`\`\``;
   }
 
@@ -1520,7 +1982,7 @@ document.addEventListener('DOMContentLoaded', () => {
       userInput.value = '';
       ajustarAlturaCaixa();
       if (!note) {
-        alert('Digite uma nota para o comando /btw');
+        alert(t('btw_alert'));
         return;
       }
       sendBtwNote(note);
@@ -1533,12 +1995,12 @@ document.addEventListener('DOMContentLoaded', () => {
       userInput.value = '';
       ajustarAlturaCaixa();
       if (!newTitle) {
-        alert(currentLang === 'en' ? 'Provide a new name: /rename <title>' : 'Digite um novo nome: /rename <nome>');
+        alert(t('rename_alert'));
         return;
       }
       if (currentSessionId) {
         await renameSession(currentSessionId, newTitle);
-        appendSystemNotification(`✏️ ${currentLang === 'en' ? 'Conversation renamed to' : 'Conversa renomeada para'}: <strong>${escapeHtml(newTitle)}</strong>`);
+        appendSystemNotification(t('renamed_notif', { title: escapeHtml(newTitle) }));
       }
       return;
     }
@@ -1566,9 +2028,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Label da mensagem do utilizador: resumo dos ficheiros + texto
     const labelMsg = [
-      filesAnexados.length ? `[${filesAnexados.length} ficheiro(s): ${filesAnexados.map(f => f.name).join(', ')}]` : '',
+      filesAnexados.length ? `[${filesAnexados.length} ${t('file_label')}: ${filesAnexados.map(f => f.name).join(', ')}]` : '',
       message,
-    ].filter(Boolean).join('  ') || (imagensAEnviar.length ? '[imagem]' : '');
+    ].filter(Boolean).join('  ') || (imagensAEnviar.length ? t('image_label') : '');
 
     // Se já estiver gerando, coloca NA FILA! Não cancela a resposta anterior!
     if (isGenerating) {
@@ -1598,7 +2060,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setGeneratingState(true);
 
     // Create Assistant response containers
-    const { assistantMsgElem, textContentElem, getOrCreateThinkBlock, finishStatusPill } = createAssistantContainer();
+    const { assistantMsgElem, textContentElem, getOrCreateThinkBlock, finishStatusPill, setStatusPill } = createAssistantContainer();
 
     try {
       const response = await fetch('/api/chat', {
@@ -1619,8 +2081,9 @@ document.addEventListener('DOMContentLoaded', () => {
           if (errData && errData.error) errMsg = errData.error;
           else if (errData && errData.message) errMsg = errData.message;
         } catch (e) {}
-        textContentElem.textContent += `\n⚠️ Erro do servidor: ${errMsg}`;
+        textContentElem.textContent += `\n${t('server_err', { err: errMsg })}`;
         finishStatusPill();
+        scrollToBottom(true);
         return;
       }
 
@@ -1639,7 +2102,7 @@ document.addEventListener('DOMContentLoaded', () => {
             currentSessionId = eventData.content;
             localStorage.setItem('apex_active_session_id', currentSessionId);
           }
-          handleSseEvent(eventData, textContentElem, getOrCreateThinkBlock, finishStatusPill);
+          handleSseEvent(eventData, textContentElem, getOrCreateThinkBlock, finishStatusPill, setStatusPill);
           if (eventData.type === 'done' || eventData.type === 'error') {
             terminado = true;
           }
@@ -1671,11 +2134,12 @@ document.addEventListener('DOMContentLoaded', () => {
       try { await reader.cancel(); } catch (e) { /* ja fechado */ }
     } catch (err) {
       if (err.name === 'AbortError') {
-        textContentElem.textContent += '\n⏹ Geração interrompida pelo utilizador.';
+        textContentElem.textContent += `\n${t('user_stopped')}`;
       } else {
-        textContentElem.textContent += `\n⚠️ Erro na conexão: ${err.message}`;
+        textContentElem.textContent += `\n${t('conn_err', { err: err.message })}`;
       }
       finishStatusPill();
+      scrollToBottom(true);
     } finally {
       finishStatusPill();
       setGeneratingState(false);
@@ -1691,34 +2155,52 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function handleSseEvent(eventData, textElem, getThinkBlock, finishStatusPill) {
+  function handleSseEvent(eventData, textElem, getThinkBlock, finishStatusPill, setStatusPill) {
     if (eventData.type === 'think_start') {
       getThinkBlock();
+      scrollToBottom();
     } else if (eventData.type === 'think_chunk') {
       const { thinkContentElem } = getThinkBlock();
       thinkContentElem.textContent += eventData.content;
+      scrollToBottom();
     } else if (eventData.type === 'think_end') {
-      // Done thinking
+      scrollToBottom();
     } else if (eventData.type === 'text_chunk') {
       finishStatusPill();
       textElem.textContent += eventData.content;
-      chatStream.scrollTop = chatStream.scrollHeight;
+      scrollToBottom();
     } else if (eventData.type === 'done') {
       finishStatusPill();
       if (!textElem.textContent.trim() && eventData.content) {
         textElem.textContent = eventData.content;
       }
-      chatStream.scrollTop = chatStream.scrollHeight;
+      scrollToBottom(true);
     } else if (eventData.type === 'error') {
       finishStatusPill();
-      // A mensagem do servidor ja costuma comecar por ⚠️; sem isto aparecia
-      // "⚠️ Erro: ⚠️ O modelo...".
+      // A mensagem do servidor ja costuma comecar por ⚠️
       const txt = String(eventData.content || '');
-      textElem.textContent += txt.trimStart().startsWith('⚠') ? `\n${txt}` : `\n⚠️ Erro: ${txt}`;
-      chatStream.scrollTop = chatStream.scrollHeight;
+      textElem.textContent += txt.trimStart().startsWith('⚠') ? `\n${txt}` : `\n${t('server_err', { err: txt })}`;
+      scrollToBottom(true);
+    } else if (eventData.type === 'turn') {
+      try {
+        const tu = JSON.parse(eventData.content);
+        if (setStatusPill) setStatusPill(t('turn_status', { turn: tu.turn, max: tu.max }));
+      } catch (e) { /* ignora */ }
+      scrollToBottom();
+    } else if (eventData.type === 'tool_start') {
+      try {
+        const ts = JSON.parse(eventData.content);
+        if (setStatusPill) setStatusPill(t('tool_running', { name: ts.name }));
+      } catch (e) { /* ignora */ }
+      scrollToBottom();
+    } else if (eventData.type === 'tool_finish') {
+      try {
+        const tf = JSON.parse(eventData.content);
+        if (setStatusPill) setStatusPill(t('tool_done', { name: tf.name }));
+      } catch (e) { /* ignora */ }
+      scrollToBottom();
     } else if (eventData.type === 'usage') {
-      // O servidor manda a contagem como string JSON dentro de `content` (o
-      // campo que o cliente SSE le sempre). Ver server.py:_handle_post_chat.
+      // O servidor manda a contagem como string JSON dentro de `content`
       try {
         const u = JSON.parse(eventData.content);
         const d = {
@@ -1736,8 +2218,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (tokEls.cache) {
           tokEls.cache.textContent = (d.cached_tokens > 0 && d.context_tokens > 0)
-            ? `♻ ${Math.round((d.cached_tokens / d.context_tokens) * 100)}% do prompt em cache`
-            : '♻ sem cache';
+            ? t('ctx_cached_text', { pct: Math.round((d.cached_tokens / d.context_tokens) * 100) })
+            : t('ctx_nocache_text');
         }
       } catch (e) {
         console.error('usage invalido:', e);
@@ -1751,7 +2233,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const roleDiv = document.createElement('div');
     roleDiv.className = 'message-role';
-    roleDiv.innerHTML = isBtw ? '💡 Você (/btw Nota Lateral)' : '👤 Você';
+    roleDiv.innerHTML = isBtw ? t('role_user_btw') : t('role_user');
 
     const bubbleDiv = document.createElement('div');
     bubbleDiv.className = 'message-bubble';
@@ -1760,18 +2242,29 @@ document.addEventListener('DOMContentLoaded', () => {
     msgDiv.appendChild(roleDiv);
     msgDiv.appendChild(bubbleDiv);
     chatStream.appendChild(msgDiv);
-    chatStream.scrollTop = chatStream.scrollHeight;
+    scrollToBottom(true);
   }
 
-  const CLAUDE_PHRASES = [
-    "Pensando...",
-    "Refletindo sobre a resposta...",
-    "Examinando arquivos e contexto...",
-    "Analisando restrições e código...",
-    "Sintetizando arquitetura da solução...",
-    "Consultando ferramentas...",
-    "Elaborando raciocínio..."
-  ];
+  const CLAUDE_PHRASES = {
+    pt: [
+      "Pensando...",
+      "Refletindo sobre a resposta...",
+      "Examinando arquivos e contexto...",
+      "Analisando restrições e código...",
+      "Sintetizando arquitetura da solução...",
+      "Consultando ferramentas...",
+      "Elaborando raciocínio..."
+    ],
+    en: [
+      "Thinking...",
+      "Reflecting on the response...",
+      "Examining files and context...",
+      "Analyzing constraints and code...",
+      "Synthesizing solution architecture...",
+      "Consulting tools...",
+      "Formulating reasoning..."
+    ]
+  };
 
   function createAssistantContainer() {
     const msgDiv = document.createElement('div');
@@ -1784,12 +2277,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const bubbleDiv = document.createElement('div');
     bubbleDiv.className = 'message-bubble';
 
+    const phrases = CLAUDE_PHRASES[currentLang] || CLAUDE_PHRASES.pt;
+
     // Claude Code activity status pill
     const statusPill = document.createElement('div');
     statusPill.className = 'claude-status-pill';
     statusPill.innerHTML = `
       <span class="claude-spinner"></span>
-      <span class="claude-phrase">${CLAUDE_PHRASES[0]}</span>
+      <span class="claude-phrase">${phrases[0]}</span>
       <span class="claude-timer">(0.0s)</span>
     `;
     bubbleDiv.appendChild(statusPill);
@@ -1803,17 +2298,25 @@ document.addEventListener('DOMContentLoaded', () => {
       const phraseSpan = statusPill.querySelector('.claude-phrase');
       if (timerSpan) timerSpan.textContent = `(${elapsed}s)`;
       if (phraseSpan) {
-        const idx = Math.floor(elapsed / 1.8) % CLAUDE_PHRASES.length;
-        phraseSpan.textContent = CLAUDE_PHRASES[idx];
+        const pList = CLAUDE_PHRASES[currentLang] || CLAUDE_PHRASES.pt;
+        const idx = Math.floor(elapsed / 1.8) % pList.length;
+        phraseSpan.textContent = pList[idx];
       }
     }, 200);
+
+    function setStatusPill(text) {
+      if (hasFinishedPill) return;
+      const phraseSpan = statusPill.querySelector('.claude-phrase');
+      if (phraseSpan) phraseSpan.textContent = text;
+      scrollToBottom();
+    }
 
     function finishStatusPill() {
       if (hasFinishedPill) return;
       hasFinishedPill = true;
       clearInterval(intervalId);
       const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-      statusPill.innerHTML = `<span>🧠 Pensou por ${totalSec}s</span>`;
+      statusPill.innerHTML = `<span>${t('thought_for', { time: totalSec })}</span>`;
       statusPill.style.animation = 'none';
       statusPill.style.background = 'rgba(168, 85, 247, 0.08)';
       statusPill.style.borderColor = 'rgba(168, 85, 247, 0.2)';
@@ -1827,6 +2330,7 @@ document.addEventListener('DOMContentLoaded', () => {
     msgDiv.appendChild(roleDiv);
     msgDiv.appendChild(bubbleDiv);
     chatStream.appendChild(msgDiv);
+    scrollToBottom(true);
 
     let thinkDetailsElem = null;
     let thinkContentElem = null;
@@ -1838,7 +2342,7 @@ document.addEventListener('DOMContentLoaded', () => {
         thinkDetailsElem.open = true;
 
         const summaryElem = document.createElement('summary');
-        summaryElem.textContent = '🧠 Pensamento e Raciocínio (Trace)';
+        summaryElem.textContent = t('think_title');
         thinkDetailsElem.appendChild(summaryElem);
 
         thinkContentElem = document.createElement('div');
@@ -1846,11 +2350,12 @@ document.addEventListener('DOMContentLoaded', () => {
         thinkDetailsElem.appendChild(thinkContentElem);
 
         bubbleDiv.insertBefore(thinkDetailsElem, textContentElem);
+        scrollToBottom();
       }
       return { thinkDetailsElem, thinkContentElem };
     }
 
-    return { assistantMsgElem: msgDiv, textContentElem, getOrCreateThinkBlock, finishStatusPill };
+    return { assistantMsgElem: msgDiv, textContentElem, getOrCreateThinkBlock, finishStatusPill, setStatusPill };
   }
 
   function appendSystemNotification(htmlText) {
@@ -1862,6 +2367,17 @@ document.addEventListener('DOMContentLoaded', () => {
     notifDiv.style.margin = '0.5rem 0';
     notifDiv.innerHTML = htmlText;
     chatStream.appendChild(notifDiv);
-    chatStream.scrollTop = chatStream.scrollHeight;
+    scrollToBottom(true);
   }
+
+  // ── Inicialização da Web UI ──────────────────────────────────────
+  applyLanguage(currentLang);
+  loadProject();
+  loadModels();
+  loadMcp();
+  loadSessions();
+  loadStatus();
+  loadNpuStatus();
+  setInterval(loadStatus, 4000);
+  setInterval(loadNpuStatus, 5000);
 });

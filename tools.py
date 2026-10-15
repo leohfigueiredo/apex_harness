@@ -319,6 +319,10 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
 
 def bash_exec(command: str, timeout: int = 60) -> str:
     """Execute a bash command in the terminal and return stdout + stderr."""
+    try:
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = 60
     use_sandbox = os.environ.get("APEX_SANDBOX", "0").lower() in ("1", "true", "yes")
     dry_run = os.environ.get("APEX_DRY_RUN", "0").lower() in ("1", "true", "yes")
     if use_sandbox or dry_run:
@@ -327,22 +331,21 @@ def bash_exec(command: str, timeout: int = 60) -> str:
         res = executor.execute(command, timeout=timeout)
         return res.to_tool_output()
 
+    # `run_shell` em vez de `subprocess.run(capture_output=True)`: um processo
+    # em background (`cmd &`) segurava o pipe e pendurava o turno para sempre.
+    # Ver o docstring de `apex_harness.sandbox.run_shell`.
+    from apex_harness.sandbox import run_shell
     try:
-        res = subprocess.run(
-            ["/bin/bash", "-c", command],
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
+        stdout, stderr, rc, timed_out = run_shell(["/bin/bash", "-c", command], timeout=timeout)
         out = []
-        if res.stdout:
-            out.append(f"STDOUT:\n{res.stdout.strip()}")
-        if res.stderr:
-            out.append(f"STDERR:\n{res.stderr.strip()}")
-        out.append(f"Exit Code: {res.returncode}")
+        if timed_out:
+            out.append(f"Error: Command timed out after {timeout} seconds (process group killed).")
+        if stdout:
+            out.append(f"STDOUT:\n{stdout.strip()}")
+        if stderr:
+            out.append(f"STDERR:\n{stderr.strip()}")
+        out.append(f"Exit Code: {rc}")
         return "\n\n".join(out)
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds."
     except Exception as e:
         return f"Error executing bash command: {str(e)}"
 
@@ -590,6 +593,60 @@ def record_wiki_skill(title: str, content: str, category: str = "workflows", tag
         return f"Error recording wiki skill: {str(e)}"
 
 
+def _agent_memory():
+    agent = get_current_agent()
+    mem = getattr(agent, "memory", None) if agent is not None else None
+    if mem is None:
+        raise RuntimeError("memoria do agente desativada (APEX_MEMORY=0) ou agente inexistente")
+    return mem
+
+
+def memory_drilldown(node_id: str, start: int = 0, max_chars: int = 12000) -> str:
+    """Devolve o output COMPLETO de um passo offloaded (N1, N2, ...)."""
+    try:
+        return _agent_memory().offloader.drilldown(node_id, start=start, max_chars=max_chars)
+    except Exception as e:
+        return f"Erro em memory_drilldown: {e}"
+
+
+def memory_canvas() -> str:
+    """Canvas Mermaid com todos os passos da tarefa atual."""
+    try:
+        return _agent_memory().offloader.canvas()
+    except Exception as e:
+        return f"Erro em memory_canvas: {e}"
+
+
+def memory_search(query: str, top_k: int = 6) -> str:
+    """Pesquisa hibrida (BM25 + vetor) na memoria de longo prazo + conversas antigas."""
+    try:
+        mem = _agent_memory()
+        atoms = mem.ltm.search(query, top_k=int(top_k or 6))
+        convs = mem.ltm.search_conversations(query, top_k=3)
+        out = []
+        if atoms:
+            out.append("## Factos (L1)")
+            out += [f"- [{a['category']}] {a['content']}" for a in atoms]
+        if convs:
+            out.append("\n## Conversas (L0)")
+            out += [f"- [{c['role']}] {c['content'][:300]}" for c in convs]
+        persona = mem.ltm.persona_text(600)
+        if persona and not out:
+            out.append("## Persona (L3)\n" + persona)
+        return "\n".join(out) if out else "Nada encontrado na memoria de longo prazo."
+    except Exception as e:
+        return f"Erro em memory_search: {e}"
+
+
+def memory_remember(fact: str, category: str = "general") -> str:
+    """Grava um facto duradouro (preferencia, ambiente, projeto, regra, armadilha)."""
+    try:
+        ok, why = _agent_memory().ltm.add_atom(fact, category, source="agent")
+        return f"Memoria {'gravada' if ok else 'ignorada'}: {why}"
+    except Exception as e:
+        return f"Erro em memory_remember: {e}"
+
+
 TOOLS_REGISTRY = {
     "web_search": web_search,
     "fetch_url": fetch_url,
@@ -610,6 +667,10 @@ TOOLS_REGISTRY = {
     "session_log": session_log,
     "consult_wiki": consult_wiki,
     "record_wiki_skill": record_wiki_skill,
+    "memory_drilldown": memory_drilldown,
+    "memory_canvas": memory_canvas,
+    "memory_search": memory_search,
+    "memory_remember": memory_remember,
 }
 
 # ---------------------------------------------------------------------------
@@ -642,7 +703,8 @@ git_status([repo_path]) · git_diff([repo_path], [staged], [file_path]) · git_l
 git_branch([repo_path], [create], [switch_to]) · git_commit(message, [repo_path], [add_all])
 rag_search(query, [mode], [top_k]) · rag_ingest(path) · recall_memory(query, [top_k])
 run_tdp_pipeline(task, [execute_code]) · session_log(event_type, content)
-consult_wiki(query, [category]) · record_wiki_skill(title, content, [category], [tags])"""
+consult_wiki(query, [category]) · record_wiki_skill(title, content, [category], [tags])
+memory_drilldown(node_id, [start]) · memory_canvas() · memory_search(query, [top_k]) · memory_remember(fact, [category])"""
 
 
 def get_tool_schemas_for(tool_names: "List[str]", all_tools: "List[Dict[str, Any]]") -> "List[Dict[str, Any]]":
@@ -995,6 +1057,60 @@ TOOLS_DEFINITION = [
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Search tags for discovery."}
                 },
                 "required": ["title", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_drilldown",
+            "description": "Return the FULL raw output of an offloaded tool step. Old tool results in the history appear as '[offload N7 · tool · ✓/✗] ...'; call this with that node_id when you need the exact text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Step id, e.g. 'N7'."},
+                    "start": {"type": "integer", "description": "Character offset for paging (default 0)."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (default 12000)."}
+                },
+                "required": ["node_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_canvas",
+            "description": "Mermaid graph of every tool step in the current task (id, tool, ok/ERRO, one-line summary). Use it to re-orient in long tasks.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Hybrid (BM25 + vector) search over long-term memory: durable facts about the user, environment and projects, plus past conversations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to recall."},
+                    "top_k": {"type": "integer", "description": "Number of facts (default 6)."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_remember",
+            "description": "Save ONE durable fact for future sessions (user preference, machine/environment detail, project convention, recurring gotcha). Do not save transient command output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "Short, self-contained sentence."},
+                    "category": {"type": "string", "enum": ["preference", "project", "environment", "workflow", "gotcha", "general"]}
+                },
+                "required": ["fact"]
             }
         }
     }

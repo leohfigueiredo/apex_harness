@@ -1,7 +1,10 @@
 import os
 import json
 import urllib.request
+import urllib.error
 import threading
+from unittest.mock import patch
+
 from apex_harness.core import ApexAgent
 from apex_harness.server import create_web_server
 
@@ -34,51 +37,65 @@ def test_agent_inject_btw():
 
 def test_web_server_endpoints():
     agent = ApexAgent(model_name="test-model", enable_mcp=False)
-    server = create_web_server(agent=agent, port=7899)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
 
-    try:
-        # GET /api/models
-        req = urllib.request.Request("http://127.0.0.1:7899/api/models")
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-            assert data["active"] == "test-model"
+    # O `_handle_get_models` devolve como `active` o modelo REAL do backend na
+    # 8080 (via detect_active_api_base + /props). Sem estes mocks, o teste
+    # dependia de qual modelo esta carregado NA MAQUINA. Apontar para uma porta
+    # morta faz o handler cair no fallback `agent.model_name`.
+    #
+    # IMPORTANTE: o `with patch` tem de envolver TAMBEM os pedidos, porque o
+    # handler corre num thread e so executa DURANTE urlopen -- um patch que
+    # expirasse antes deixava o teste acoplado ao backend vivo outra vez.
+    with patch("apex_harness.core.detect_active_api_base",
+               return_value="http://127.0.0.1:1/v1"), \
+         patch("apex_harness.server._get_llama_server_active_props", return_value={}):
+        server = create_web_server(agent=agent, port=7899)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
 
-        # POST /api/model
-        req_model = urllib.request.Request(
-            "http://127.0.0.1:7899/api/model",
-            data=json.dumps({"model": "deepseek-r1-distill"}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req_model) as resp:
-            data = json.loads(resp.read().decode())
-            assert data["status"] == "ok"
-            assert data["active"] == "deepseek-r1-distill"
-            assert agent.model_name == "deepseek-r1-distill"
+        try:
+            # GET /api/models
+            req = urllib.request.Request("http://127.0.0.1:7899/api/models")
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                assert data["active"] == "test-model"
 
-        # POST /api/btw
-        req_btw = urllib.request.Request(
-            "http://127.0.0.1:7899/api/btw",
-            data=json.dumps({"note": "Foque no desempenho"}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req_btw) as resp:
-            data = json.loads(resp.read().decode())
-            assert data["status"] == "ok"
-            assert any("[BY-THE-WAY" in m.get("content", "") for m in agent.history)
+            # POST /api/model com um modelo que NAO existe no disco: 404 claro.
+            req_model = urllib.request.Request(
+                "http://127.0.0.1:7899/api/model",
+                data=json.dumps({"model": "deepseek-r1-distill"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            try:
+                urllib.request.urlopen(req_model)
+                assert False, "esperado 404 para um modelo inexistente"
+            except urllib.error.HTTPError as e:
+                assert e.code == 404
+                corpo = json.loads(e.read().decode())
+                assert "não foi encontrado" in corpo.get("message", "")
 
-        # GET /api/wiki
-        req_wiki = urllib.request.Request("http://127.0.0.1:7899/api/wiki")
-        with urllib.request.urlopen(req_wiki) as resp:
-            data = json.loads(resp.read().decode())
-            assert data["status"] == "ok"
-            assert "articles" in data
+            # POST /api/btw
+            req_btw = urllib.request.Request(
+                "http://127.0.0.1:7899/api/btw",
+                data=json.dumps({"note": "Foque no desempenho"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_btw) as resp:
+                data = json.loads(resp.read().decode())
+                assert data["status"] == "ok"
+                assert any("[BY-THE-WAY" in m.get("content", "") for m in agent.history)
 
-    finally:
-        server.shutdown()
+            # GET /api/wiki
+            req_wiki = urllib.request.Request("http://127.0.0.1:7899/api/wiki")
+            with urllib.request.urlopen(req_wiki) as resp:
+                data = json.loads(resp.read().decode())
+                assert data["status"] == "ok"
+                assert "articles" in data
+
+        finally:
+            server.shutdown()
 
 
 def test_consecutive_chat_requests():
@@ -86,7 +103,7 @@ def test_consecutive_chat_requests():
     agent = ApexAgent(model_name="test-model", enable_mcp=False)
 
     call_count = {"count": 0}
-    def fake_step(user_input, on_chunk=None, on_usage=None, images=None):
+    def fake_step(user_input, on_chunk=None, on_usage=None, images=None, **kwargs):
         call_count["count"] += 1
         resp = f"Resposta {call_count['count']}: {user_input}"
         if on_chunk:

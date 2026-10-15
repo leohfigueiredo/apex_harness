@@ -29,7 +29,11 @@ def test_manager_start_not_usable():
     )
 
     with patch("apex_harness.npu_backend.npu_available", return_value=mock_status):
-        mgr = NPUServerManager()
+        # Porta unica e obrigatoria: is_running() faz um PROBE de rede no porto.
+        # Na suite completa outro teste pode deixar o porto 8090 ocupado, e o
+        # probe dizia "running" para um manager acabado de criar. Uma porta alta
+        # isolada torna o teste deterministico.
+        mgr = NPUServerManager(port=18090)
         started = mgr.start()
         assert started is False
         assert mgr.is_running() is False

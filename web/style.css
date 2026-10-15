@@ -257,6 +257,8 @@ body {
   flex-direction: column;
   height: 100vh;
   position: relative;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .header {
@@ -489,10 +491,12 @@ body {
 .chat-stream {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: 1.5rem;
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
+  min-height: 0;
 }
 
 .welcome-card {
@@ -1256,5 +1260,157 @@ body {
   opacity: 0.75;
   cursor: wait;
 }
+
+/* ── Modal de Memória Hierárquica ───────────────────────────────── */
+.memory-modal-card {
+  max-width: 860px;
+  width: 90vw;
+  height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.memory-modal-body {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 1.25rem;
+  gap: 1rem;
+}
+
+.memory-tabs {
+  display: flex;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.mem-tab-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  padding: 0.45rem 0.85rem;
+  border-radius: 6px;
+  font-size: 0.84rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.mem-tab-btn:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mem-tab-btn.active {
+  color: var(--accent-cyan);
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.3);
+  font-weight: 500;
+}
+
+.mem-tab-pane {
+  display: none;
+  flex: 1;
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.mem-tab-pane.active {
+  display: flex;
+}
+
+.mem-pane-desc {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.mermaid-code-box,
+.persona-text-box {
+  background: #0d1117;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 1rem;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.82rem;
+  color: #c9d1d9;
+  white-space: pre-wrap;
+  word-break: break-all;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.mem-add-atom-bar,
+.mem-search-bar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.mem-add-atom-bar input,
+.mem-search-bar input {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 0.45rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.mem-add-atom-bar select {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 0.45rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+.mem-atoms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.mem-atom-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.6rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.mem-atom-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.75rem;
+}
+
+.mem-atom-cat {
+  background: rgba(0, 212, 255, 0.15);
+  color: var(--accent-cyan);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  text-transform: uppercase;
+  font-weight: 600;
+  font-size: 0.68rem;
+}
+
+.mem-atom-fact {
+  font-size: 0.86rem;
+  color: var(--text-main);
+  line-height: 1.4;
+}
+
 
 

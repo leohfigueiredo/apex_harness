@@ -15,7 +15,8 @@ import traceback
 
 MODELS_QUEUE = [
     # 1. Apex Harness Primary & Lightweight essentials
-    ("ukisai/Swift-Qwen3.8-27B-GGUF", "Swift-Qwen3.8-27B-Q4_K_M.gguf", 16.79),
+    ("ukisai/Swift-1.5-Qwen3.8-27B-GGUF", "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf", 17.44),
+    ("bartowski/Cloudflare_clef-flash-GGUF", "Cloudflare_clef-flash-Q4_K_M.gguf", 5.63),
     ("lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF", "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf", 4.36),
     ("Ma7ee7/Qwen3.8_4B_Distilled_GGUF", "qwen3-4b-thinking-2507.Q8_0.gguf", 3.99),
     ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3-Coder-30B-A3B-Instruct-Q4_K_S.gguf", 16.26),
@@ -38,7 +39,7 @@ MODELS_QUEUE = [
     ("antirez/deepseek-v4-gguf", "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf", 80.76),
 ]
 
-BASE_DIR = "/run/media/leonardo/Windows/AIModels"
+BASE_DIR = "/run/media/leonardo/C69ADBDF9ADBCA57/AIModels"
 STATUS_FILE = os.path.join(BASE_DIR, "download_status.json")
 LOG_FILE = os.path.join(BASE_DIR, "download_queue.log")
 

@@ -110,6 +110,36 @@ def estimate_token_throughput(
     }
 
 
+def _parse_lenient_args(raw: str) -> dict:
+    """
+    Converte `{command: "ls", n: 3}` (chaves SEM aspas) em dict.
+
+    O formato de tool call do Nemotron-3.5 usa `call:name{args}` onde `args` nao
+    e JSON valido -- as chaves vem sem aspas e podem sobrar chavetas finais
+    (ex.: `call:bash_exec{command: "..."}}`). Tenta JSON primeiro; se falhar,
+    extrai pares `chave: valor` com um regex permissivo.
+    """
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+
+    out: dict = {}
+    # Chave `k` seguida de `:` e de um valor que pode ser: string entre aspas
+    # duplas, string entre aspas simples, ou texto ate virgula/chaveta. Usa-se
+    # string de aspas duplas para o regex, para nao ter de escapar a aspa.
+    padrao = re.compile(r"([\w.\-]+)\s*:\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^,}]+)")
+    for m in padrao.finditer(raw):
+        k = m.group(1)
+        v = m.group(2).strip()
+        if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
 def extract_text_tool_calls(text: str) -> List[Tuple[str, dict]]:
     """Extract tool calls emitted as text/tags when local models don't use structured OpenAI output."""
     if not text:
@@ -151,7 +181,119 @@ def extract_text_tool_calls(text: str) -> List[Tuple[str, dict]]:
         except Exception:
             pass
 
+    # 3. Formato de CANAIS do Nemotron-3.5 (e de outros modelos com special
+    #    tokens de channel). Medido no harness, com o Nemotron-30B-A3B:
+    #
+    #        <|tool_call>call:bash_exec{command: "ls ... | wc -l"}}<tool_call|>
+    #
+    #    Nao e JSON (chave `command` sem aspas), o nome vem em `call:NAME{...}`,
+    #    e o fecho e `<tool_call|>` com PIPE, nao `</tool_call>`. Nenhum dos
+    #    padroes acima casava -- o tool call era tratado como texto, nenhuma
+    #    ferramenta executava, e o turno "parava" logo a seguir a dizer que ia
+    #    fazer algo. Este e o padrao que falta.
+    channel_matches = re.findall(r'<\|tool_call>(.*?)<tool_call\|>', text, re.DOTALL)
+    for block in channel_matches:
+        m = re.match(r'call:\s*([\w.\-]+)\s*(\{.*\})', block.strip(), re.DOTALL)
+        if not m:
+            continue
+        name = m.group(1)
+        args = _parse_lenient_args(m.group(2))
+        if name and isinstance(args, dict) and (str(name), args) not in calls:
+            calls.append((str(name), args))
+
+    # 4. Formato XML do Qwen3-Coder / Qwen3.6 (o template nativo deles):
+    #
+    #        <tool_call>
+    #        <function=write_file>
+    #        <parameter=path>
+    #        backend/app/main.py
+    #        </parameter>
+    #        <parameter=content>
+    #        ...
+    #        </parameter>
+    #        </function>
+    #        </tool_call>
+    #
+    #    Medido em 08/10 com Qwen3.6-35B-A3B: quando o llama-server nao o
+    #    converte em `tool_calls` estruturado (ex.: o modelo escreve-o DENTRO do
+    #    bloco de raciocinio), nenhum padrao acima casava e o turno terminava
+    #    "a meio", com o modelo a dizer "Vou fazer tudo de uma vez." e mais nada.
+    #    Exige-se o `</function>` de fecho: uma chamada truncada nao deve gravar
+    #    um ficheiro pela metade.
+    for fm in re.finditer(r'<function=([\w.\-]+)>(.*?)</function>', text, re.DOTALL):
+        name = fm.group(1)
+        args: dict = {}
+        for pm in re.finditer(r'<parameter=([\w.\-]+)>(.*?)</parameter>', fm.group(2), re.DOTALL):
+            args[pm.group(1)] = _coerce_xml_param(pm.group(1), pm.group(2))
+        if name and (str(name), args) not in calls:
+            calls.append((str(name), args))
+
     return calls
+
+
+# Chaves cujo valor e SEMPRE texto livre (conteudo de ficheiro, comando...).
+# Nunca se tenta converte-las para numero/JSON: um ficheiro com "123" ou um
+# package.json tem de ser gravado tal e qual.
+_XML_TEXT_KEYS = {
+    "content", "command", "text", "code", "query", "message", "patch", "diff",
+    "old_string", "new_string", "old_content", "new_content", "old_str", "new_str",
+    "search", "replace", "replacement", "prompt", "note", "path", "url",
+}
+
+
+def _coerce_xml_param(key: str, raw: str) -> Any:
+    """Valor de um `<parameter=...>` do formato XML do Qwen."""
+    # O template poe o valor entre quebras de linha; tira-se SO uma de cada
+    # lado, para nao estragar a indentacao de codigo dentro de `content`.
+    v = raw
+    if v.startswith("\n"):
+        v = v[1:]
+    if v.endswith("\n"):
+        v = v[:-1]
+    if key in _XML_TEXT_KEYS:
+        return v
+    s = v.strip()
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return float(s)
+    if s in ("true", "false"):
+        return s == "true"
+    if s[:1] in "[{":
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+    return v
+
+
+_TOOL_MARKUP_RE = re.compile(
+    r"</?tool_call\b|<\|tool_call>|<tool_call\|>|<function=|</function>|<parameter=|</parameter>"
+)
+
+
+def has_tool_markup(text: str) -> bool:
+    """True se o texto traz restos de uma chamada de ferramenta em formato texto."""
+    return bool(text) and bool(_TOOL_MARKUP_RE.search(text))
+
+
+# Quantas vezes, por turno, se pede ao modelo para repetir uma chamada de
+# ferramenta que saiu malformada / so no raciocinio, antes de desistir.
+MAX_NUDGES_PER_STEP = 2
+
+# Detecao de ciclo: a partir de LOOP_WARN_AT chamadas identicas seguidas o
+# resultado leva um aviso para o modelo; em LOOP_ABORT_AT o turno e cortado.
+LOOP_WARN_AT = 2
+LOOP_ABORT_AT = 4
+
+_NUDGE_MSG = (
+    "[AVISO DO HARNESS] A tua ultima resposta nao executou nada: a chamada de "
+    "ferramenta saiu malformada, incompleta ou ficou dentro do bloco de "
+    "raciocinio, por isso foi ignorada. Nenhum ficheiro foi criado nesse passo. "
+    "Continua a tarefa de onde paraste: emite AGORA a chamada de ferramenta "
+    "completa no formato nativo (fora do raciocinio), uma de cada vez. Se a "
+    "tarefa ja estiver terminada, responde ao utilizador com o resumo final."
+)
 
 
 REASONING_PROMPTS = {
@@ -254,11 +396,11 @@ class ApexAgent:
         self.api_key = api_key or os.environ.get("APEX_API_KEY", "no-key-required")
         if not model_name:
             if "1234" in self.base_url:
-                default_model = "swift-qwen3.8-27b@q4_k_m"
+                default_model = "swift-1.5-qwen3.8-27b@q4_k_m"
             elif "8080" in self.base_url:
-                default_model = "llama-local-model"
+                default_model = "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"
             else:
-                default_model = "local-model"
+                default_model = "Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf"
             self.model_name = os.environ.get("APEX_MODEL", default_model)
         else:
             self.model_name = model_name
@@ -310,6 +452,16 @@ class ApexAgent:
         if self.enable_mcp:
             self._init_mcp()
 
+        # Memória Simbólica e em Camadas (TencentDB-Agent-Memory pattern)
+        self.memory = None
+        try:
+            from apex_harness.agent_memory import AgentMemory, memory_enabled
+            if memory_enabled():
+                sess_id = os.environ.get("APEX_SESSION_ID", "default_session")
+                self.memory = AgentMemory(session_id=sess_id)
+        except Exception as _e:
+            self.memory = None
+
         set_current_agent(self)
 
         # Warm-up Jev in background so the first real ask_permit() hits a warm
@@ -349,6 +501,13 @@ class ApexAgent:
         effort_instr = REASONING_PROMPTS.get(self.reasoning_effort, "")
         if effort_instr:
             base = f"{base}\n\n{effort_instr}"
+        if getattr(self, "memory", None):
+            try:
+                p_block = self.memory.persona_block()
+                if p_block:
+                    base = f"{base}\n{p_block}"
+            except Exception:
+                pass
         return base
 
     def set_reasoning_effort(self, effort: str) -> str:
@@ -517,6 +676,15 @@ class ApexAgent:
           4. Preserve the last 3 tool result messages verbatim so the agent doesn't lose current execution context.
           5. Keep the last user message so the current task is not lost.
         """
+        # Step 0 — Offload simbólico (TencentDB-Agent-Memory pattern):
+        # Descarrega outputs brutos antigos para disco (refs/N<id>.md) e deixa stubs
+        # leves no histórico. O modelo pode consultar o texto completo com memory_drilldown(id).
+        if getattr(self, "memory", None) and hasattr(self.memory, "offloader"):
+            try:
+                self.memory.offloader.offload_history(self.history, keep_last=3, min_chars=500)
+            except Exception:
+                pass
+
         # Step 1 — truncate individual giants
         for msg in self.history:
             cnt = message_text(msg.get("content"))
@@ -783,7 +951,8 @@ class ApexAgent:
         on_tool_finish: Optional[Callable[[str, str], None]] = None,
         on_chunk: Optional[Callable[[str], None]] = None,
         on_usage: Optional[Callable[[Dict[str, Any]], None]] = None,
-        images: Optional[List[str]] = None
+        images: Optional[List[str]] = None,
+        on_turn: Optional[Callable[[int], None]] = None
     ) -> str:
         self._in_reasoning = False
 
@@ -797,6 +966,14 @@ class ApexAgent:
         # anteriores. Inserido ANTES da mensagem do utilizador, para garantir
         # que a conversa termina sempre com role: "user" (evita quebrar templates Jinja/OpenAI).
         recalled = self._recall_from_rag(user_input)
+        if getattr(self, "memory", None):
+            try:
+                ltm_rec = self.memory.ltm.recall_block(user_input, top_k=4)
+                if ltm_rec:
+                    recalled = f"{recalled}\n\n[MEMORIA DE LONGO PRAZO / FACTOS]:\n{ltm_rec}" if recalled else ltm_rec
+            except Exception:
+                pass
+
         if recalled:
             self.history.append({
                 "role": "user",
@@ -848,8 +1025,24 @@ class ApexAgent:
             except Exception:
                 pass  # keep keyword fallback
 
+        # Detecao de ciclo: se o modelo pedir EXACTAMENTE a mesma ferramenta com
+        # os mesmos argumentos N vezes seguidas, e sinal de loop degenerativo.
+        # O mesmo pedido de "vou fazer X" repetido nao avanca o trabalho; deixar
+        # isto andar queima as 40 voltas em silencio e so no fim devolve o
+        # "limite atingido". Aborta-se cedo, com uma mensagem que se percebe.
+        _ultima_sig = None
+        _repeticoes = 0
+        _ultimo_resultado = None
+        # Pedidos de "repete a chamada" ja feitos neste turno. Ver _NUDGE_MSG.
+        _nudges = 0
+
         while turns < self.max_turns:
             turns += 1
+            if on_turn:
+                try:
+                    on_turn(turns)
+                except Exception:
+                    pass
             request_kwargs = {
                 "model": self.model_name,
                 "messages": self._sanitize_messages(self.history),
@@ -884,7 +1077,9 @@ class ApexAgent:
                                 target_path = m["path"]
                                 break
                         if not target_path:
-                            target_path = "/run/media/leonardo/Windows/AIModels/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q3_K_S.gguf"
+                            target_path = "/run/media/leonardo/C69ADBDF9ADBCA57/AIModels/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q3_K_S.gguf"
+                            if not os.path.exists(target_path):
+                                target_path = "/run/media/leonardo/Windows/AIModels/ukisai/Swift-1.5-Qwen3.8-27B-GGUF/Swift-1.5-Qwen3.8-27B-Q3_K_S.gguf"
                         if os.path.exists(target_path):
                             if on_chunk:
                                 on_chunk("🔄 Backend local (porta 8080) estava offline. Reiniciando servidor...\n")
@@ -1065,6 +1260,33 @@ class ApexAgent:
 
             # If no tools were invoked at all, this turn is completed
             if not tool_calls_map:
+                # ...a nao ser que o modelo QUISESSE chamar uma ferramenta e a
+                # chamada se tenha perdido. Medido em 08/10 (Qwen3.6-35B-A3B):
+                # depois de criar 14 ficheiros, o raciocinio terminou em
+                #   "Vou fazer tudo de uma vez.</parameter></function></tool_call>"
+                # sem `content` nem `tool_calls`. O harness tratava isso como
+                # resposta final e o trabalho "parava" sem explicacao.
+                # Dois sinais de que o turno NAO acabou:
+                #   * ha marcacao de tool call no texto/raciocinio que nao se
+                #     conseguiu interpretar;
+                #   * so houve raciocinio, a meio de uma sequencia de ferramentas
+                #     (turns > 1) -- o modelo ia fazer algo e nao fez.
+                # Pede-se ao modelo para repetir (no maximo MAX_NUDGES_PER_STEP),
+                # sem guardar a resposta partida no historico.
+                content_text = "".join(accumulated_content)
+                sem_content = not content_text.strip()
+                markup_perdida = has_tool_markup(content_text) or has_tool_markup(reasoning_text)
+                so_raciocinio_a_meio = turns > 1 and sem_content and bool(reasoning_text)
+                if (markup_perdida or so_raciocinio_a_meio) and _nudges < MAX_NUDGES_PER_STEP:
+                    _nudges += 1
+                    if on_chunk:
+                        try:
+                            on_chunk("\n🔁 Chamada de ferramenta perdida/malformada — a pedir ao modelo para continuar...\n")
+                        except Exception:
+                            pass
+                    self.history.append({"role": "user", "content": _NUDGE_MSG})
+                    continue
+
                 if not full_text.strip():
                     if self.history and self.history[-1].get("role") == "user":
                         self.history.pop()
@@ -1075,6 +1297,11 @@ class ApexAgent:
                         "Tente reformular sua pergunta ou use /compact para liberar contexto."
                     )
                 self.history.append({"role": "assistant", "content": full_text})
+                if getattr(self, "memory", None):
+                    try:
+                        self.memory.after_turn(user_input, full_text)
+                    except Exception:
+                        pass
                 return full_text
 
             # Model requested tool calls
@@ -1137,14 +1364,64 @@ class ApexAgent:
                     except Exception:
                         pass  # Jev unavailable → proceed normally
 
+                # Ciclo degenerativo: mesma ferramenta + mesmos argumentos, de
+                # novo. Antes cortava-se a 3a repeticao sem avisar o modelo, e o
+                # turno "parava" mesmo quando ele so estava a reconfirmar um
+                # `ls`. Agora: da LOOP_WARN_AT em diante o resultado leva um
+                # aviso explicito; so em LOOP_ABORT_AT se aborta.
+                sig = f"{name}:{raw_args}"
+                if sig == _ultima_sig:
+                    _repeticoes += 1
+                else:
+                    _ultima_sig = sig
+                    _repeticoes = 1
+                    _ultimo_resultado = None
+                if _repeticoes >= LOOP_ABORT_AT:
+                    loop_msg = (
+                        f"⏹️ Loop detetado: a ferramenta '{name}' foi chamada "
+                        f"{_repeticoes} vezes seguidas com os mesmos argumentos, sem "
+                        f"progresso. Interrompido para nao gastar as {self.max_turns} "
+                        f"voltas em vazio. Se a tarefa ficou por terminar, reformula "
+                        f"o pedido ou usa /clear para reiniciar o contexto."
+                    )
+                    if on_tool_finish:
+                        on_tool_finish(name, loop_msg)
+                    self.history.append({"role": "assistant", "content": loop_msg})
+                    return loop_msg
+
                 set_current_agent(self)
                 result_str = execute_tool(name, args)
+
+                # Registo do output COMPLETO na memória simbólica antes de qualquer compressão
+                if getattr(self, "memory", None) and hasattr(self.memory, "offloader"):
+                    try:
+                        self.memory.offloader.record(
+                            tool=name,
+                            args=args,
+                            raw_output=result_str,
+                            tool_call_id=tc.get("id")
+                        )
+                    except Exception:
+                        pass
+
                 # Tier-2 / Visibility Ladder: compress verbose tool outputs
                 # before they enter the history (and thus get re-sent every turn).
                 # compress_tool_output applies per-tool line limits:
                 #   bash_exec → 80 lines, read_file → 120 lines, etc.
                 # A truncation marker is appended so the model can ask for more.
                 result_str = compress_tool_output(name, result_str)
+
+                if _repeticoes >= LOOP_WARN_AT:
+                    igual = " e o resultado foi identico" if result_str == _ultimo_resultado else ""
+                    result_str = (
+                        f"{result_str}\n\n[AVISO DO HARNESS] E a {_repeticoes}a vez seguida "
+                        f"que chamas '{name}' com exatamente os mesmos argumentos{igual}. "
+                        f"Nao repitas: usa o resultado acima e avanca para o proximo "
+                        f"passo (ou responde ao utilizador). A {LOOP_ABORT_AT}a repeticao "
+                        f"o turno e interrompido."
+                    )
+                else:
+                    _ultimo_resultado = result_str
 
                 if on_tool_finish:
                     on_tool_finish(name, result_str)
@@ -1156,6 +1433,10 @@ class ApexAgent:
                     "content": result_str
                 })
 
-        timeout_msg = "Limite máximo de execução de ferramentas atingido (15 turnos)."
+        timeout_msg = (
+            f"⏱️ Limite de {self.max_turns} voltas atingido sem resposta final. "
+            f"O modelo continuava a chamar ferramentas. O trabalho feito ate aqui "
+            f"esta no historico; usa /continue ou reformula o pedido para terminar."
+        )
         self.history.append({"role": "assistant", "content": timeout_msg})
         return timeout_msg

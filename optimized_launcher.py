@@ -63,6 +63,23 @@ def build_command(
     verbose: bool = True,
 ) -> Tuple[List[str], dict]:
     """Plan an optimised llama-server invocation. Returns (argv, env)."""
+    if "diffusion" in os.path.basename(model_path).lower():
+        env = os.environ.copy()
+        env["NGL"] = "31"
+        venv_py = "/home/leonardo/apex_harness/.venv/bin/python"
+        py_bin = venv_py if os.path.exists(venv_py) else sys.executable
+        env["PYTHONPATH"] = "/home/leonardo/apex_harness"
+        argv = [
+            py_bin,
+            "-m",
+            "apex_harness.diffusion_server",
+            "--model",
+            model_path,
+            "--port",
+            str(port),
+        ]
+        return argv, env
+
     bin_path = server_bin or DEFAULT_SERVER
 
     # Thin models that live on a slow spinning disk (ntfs3 on /dev/sda) should be
